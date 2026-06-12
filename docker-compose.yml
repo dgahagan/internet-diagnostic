@@ -1,0 +1,36 @@
+# netwatch must run with host networking: in a bridge network it would probe
+# Docker's NAT, not your LAN, and the gateway probe would point at the Docker
+# bridge instead of your router. With network_mode: host its vantage point is
+# identical to the host's.
+#
+#   docker compose up -d --build            # netwatch only
+#   docker compose --profile ntfy up -d     # netwatch + a LAN ntfy server
+
+services:
+  netwatch:
+    build: .
+    image: netwatch
+    container_name: netwatch
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # Uncomment to push incident alerts to a LAN ntfy topic:
+      # NETWATCH_NTFY_URL: http://<lan-ip>:8090/internet-alerts
+      NETWATCH_INTERVAL: 5
+    volumes:
+      - ./data:/data:z
+
+  # Optional self-hosted push server for phone alerts (ntfy Android app with
+  # "instant delivery" works fully offline-from-the-internet on your LAN).
+  ntfy:
+    image: binwiederhier/ntfy
+    container_name: ntfy
+    command: serve
+    restart: unless-stopped
+    ports:
+      - "8090:80"
+    environment:
+      NTFY_CACHE_FILE: /var/cache/ntfy/cache.db
+    volumes:
+      - ./ntfy-cache:/var/cache/ntfy:z
+    profiles: [ntfy]

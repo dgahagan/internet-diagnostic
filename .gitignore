@@ -1,0 +1,6 @@
+data/
+ntfy-cache/
+*.log
+
+# machine-specific deployment notes, not for publishing
+docs/HOMELAB.md

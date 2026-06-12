@@ -1,0 +1,12 @@
+[Unit]
+Description=netwatch — layered internet-connectivity watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/bin/netwatch.sh
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
