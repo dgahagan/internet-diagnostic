@@ -126,6 +126,16 @@ endpoint of a provider you care about. Wire its alerts to the same LAN ntfy
 topic. During an outage the dashboard rows going red top-down mirror
 netwatch's verdict, with graphs.
 
+> **Kuma 1.23.x + ntfy gotcha:** the ntfy provider builds a "view" action
+> button from the monitor's URL field, which ping/DNS/port monitors don't
+> have — the ntfy server rejects those alerts with HTTP 400 and they
+> **silently never arrive** (Kuma's "Test" button works, because test sends
+> skip the button). Workaround: set each non-HTTP monitor's URL field to
+> any valid URL, e.g. its own dashboard link
+> (`http://<kuma-host>/dashboard/<monitor-id>`). Don't trust the test
+> button — verify by making a monitor genuinely fail once (point it at
+> `192.0.2.1` briefly) and confirming the alert reaches your phone.
+
 Caveat worth knowing: a suspend/resume or a deliberate router reboot looks
 like an incident — check report timestamps against what you were doing.
 
