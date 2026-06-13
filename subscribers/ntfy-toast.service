@@ -1,0 +1,14 @@
+[Unit]
+Description=ntfy-toast — desktop notifications for netwatch outage alerts
+After=graphical-session.target
+
+[Service]
+# Point these at your LAN ntfy server / topic:
+Environment=NTFY_SERVER=http://192.168.1.100:8090
+Environment=NTFY_TOPIC=internet-alerts
+ExecStart=%h/bin/ntfy-toast.sh
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
