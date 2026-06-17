@@ -156,6 +156,25 @@ section() {
 
 CURL_TIMING_FMT='dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s http=%{http_code}\n'
 
+# Heuristics for "something is redirecting DNS / tunneling" — most often a VPN.
+# Prints one indicator per line; no output means none detected. A VPN that
+# pushes all DNS to its own server breaks the system resolver (getent, hostname
+# HTTPS) while leaving direct `dig @server` queries — and the rest of the
+# network — working, which is exactly the dns_system-fails/dig-probes-pass
+# pattern the verdict keys on.
+vpn_indicators() {
+    # Userspace VPNs often park their tunnel address on lo rather than a tun dev
+    ip -o addr show dev lo 2>/dev/null \
+        | awk '$4 !~ /^127\./ && $4 !~ /^::1\// {print "non-loopback address on lo: " $4}'
+    # Kernel tunnel interfaces
+    ip -br link show 2>/dev/null \
+        | awk '$1 ~ /^(tun|tap|wg|ppp|utun)[0-9]*/ {print "tunnel interface present: " $1}'
+    # A resolved link advertising the catch-all (~.) routing domain captures ALL
+    # name resolution for the host
+    have resolvectl && resolvectl domain 2>/dev/null \
+        | awk '/~\./ {print "resolver catch-all routing domain: " $0}'
+}
+
 snapshot() {
     echo "### Deep snapshot at $(date -Is)"
     section "Interfaces"      ip -br addr
@@ -163,6 +182,8 @@ snapshot() {
     section "IPv6 routes"     ip -6 route show default
     section "Neighbors (ARP)" ip neigh
     have resolvectl && section "resolvectl status" resolvectl status
+    printf '\n--- VPN / DNS-redirect indicators ---\n'
+    vpn_indicators | grep . || echo "(none detected)"
     section "Ping gateway x5"  ping -n -c5 -i0.3 -W2 "$GATEWAY"
     section "Ping 1.1.1.1 x5"  ping -n -c5 -i0.3 -W2 1.1.1.1
     section "curl timing google.com (IPv4)" \
@@ -211,10 +232,23 @@ verdict() {
         echo "VERDICT: WAN outage — gateway reachable but nothing past it."
         echo "Suspect: modem/ONT resync or ISP-side outage."
     elif [[ $dns_ok -eq 0 ]]; then
-        echo "VERDICT: DNS failure — raw connectivity fine, name resolution broken."
-        if [[ $HAS_DIG -eq 1 && $(fc dns_router) -gt 0 && $(fc dns_public) -eq 0 ]]; then
+        if [[ $HAS_DIG -eq 1 && $(fc dns_router) -eq 0 && $(fc dns_public) -eq 0 ]]; then
+            echo "VERDICT: system resolver redirected — resolution via the system"
+            echo "resolver failed while direct DNS queries to BOTH the router and"
+            echo "1.1.1.1 succeeded. The network, the ISP, and the DNS servers are"
+            echo "fine; something redirected only this host's resolver path. Most"
+            echo "often a VPN pushing all DNS to its own server (see the VPN / DNS-"
+            echo "redirect indicators in the snapshot). The fix is VPN/resolver-side."
+        elif [[ $HAS_DIG -eq 1 && $(fc dns_router) -gt 0 && $(fc dns_public) -eq 0 ]]; then
+            echo "VERDICT: DNS failure — raw connectivity fine, name resolution broken."
             echo "Router's DNS forwarder failed while public DNS (1.1.1.1) worked —"
             echo "pointing your machine/DHCP at 1.1.1.1/8.8.8.8 directly would dodge this."
+        else
+            echo "VERDICT: DNS failure — raw connectivity fine, name resolution broken."
+        fi
+        if [[ -n $VPN_AT_OPEN ]]; then
+            echo "VPN/redirect indicators captured at incident start:"
+            printf '%s\n' "$VPN_AT_OPEN" | sed 's/^/  - /'
         fi
     elif [[ $(fc https_google) -gt 0 || $(fc https_cloudflare) -gt 0 || $(fc https_aws) -gt 0 ]]; then
         if [[ $(fc https_google) -eq 0 && $(fc https_cloudflare) -eq 0 && $(fc https_aws) -gt 0 ]]; then
@@ -248,6 +282,7 @@ verdict() {
 INCIDENT_FILE=""
 INCIDENT_START=0
 SNAP_PID=""
+VPN_AT_OPEN=""
 
 incident_open() {
     mkdir -p "$INCIDENT_DIR"
@@ -255,6 +290,9 @@ incident_open() {
     INCIDENT_FILE="$INCIDENT_DIR/incident-$(date +%Y%m%d-%H%M%S).md"
     INCIDENT_CYCLES=0
     FAIL_COUNT=()
+    # Captured now (foreground), while a VPN that triggered the incident is most
+    # likely still attached — the daemon may restart/recover before close.
+    VPN_AT_OPEN=$(vpn_indicators)
     log "INCIDENT OPENED — failing: ${CYCLE_FAILED[*]} — $INCIDENT_FILE"
     notify critical "Internet incident" "Failing: ${CYCLE_FAILED[*]}"
     {

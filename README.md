@@ -181,10 +181,16 @@ Each incident report contains:
 1. **Timeline** — one row per 5s cycle, `.`/`X` per probe, so you can watch
    the failure spread and recover.
 2. **Verdict** — failure counts per probe and a plain-English diagnosis
-   (LAN vs WAN vs DNS vs TCP/NAT vs TLS/MTU vs single-destination).
+   (LAN vs WAN vs DNS vs TCP/NAT vs TLS/MTU vs single-destination). The DNS
+   case is split further: if the system resolver fails while direct `dig`
+   to *both* the router and 1.1.1.1 still answers, the verdict is **system
+   resolver redirected** — your resolver path was hijacked (typically a VPN
+   pushing all DNS to its own server) rather than the network or ISP breaking.
 3. **Snapshot** — captured at incident start: interface/route/ARP state,
    ping statistics, curl timing splits (`dns=… connect=… tls=…`), verbose
-   TLS handshake, and an mtr/traceroute path.
+   TLS handshake, an mtr/traceroute path, and VPN / DNS-redirect indicators
+   (a tunnel address on `lo`, a `tun`/`wg` device, or a resolved `~.`
+   catch-all routing domain).
 
 ## Companion setup
 
