@@ -254,6 +254,21 @@ verdict() {
         if [[ $(fc https_google) -eq 0 && $(fc https_cloudflare) -eq 0 && $(fc https_aws) -gt 0 ]]; then
             echo "VERDICT: destination-specific — only AWS us-east-1 failed; everything"
             echo "else was healthy. Not your network; upstream provider issue."
+        elif [[ $(fc https_google) -eq 0 && $(fc https_aws) -eq 0 && $(fc https_cloudflare) -gt 0 ]]; then
+            # Several probes (wan_ping_cf, tcp_443, https_ip, dns_public) all
+            # target 1.1.1.1, so a Cloudflare-only reachability loss would
+            # otherwise trip the tcp_443 "conntrack" branch below. Google AND
+            # AWS staying up proves the rest of the internet — and your TCP
+            # stack — were fine, so the only thing broken is the path to one
+            # anycast provider.
+            echo "VERDICT: single upstream unreachable — only Cloudflare/1.1.1.1 was"
+            echo "affected (ping 1.1.1.1, raw TCP + TLS to 1.1.1.1, cp.cloudflare.com,"
+            echo "and @1.1.1.1 DNS all failed) while Google, AWS, and 8.8.8.8 stayed up"
+            echo "the whole time. The rest of the internet was fine: this is a routing/"
+            echo "peering failure on the path to Cloudflare, upstream of you (see the"
+            echo "mtr to 1.1.1.1 in the snapshot) — NOT your router or a TCP/conntrack"
+            echo "problem. If 1.1.1.1 is your primary resolver, put a non-Cloudflare"
+            echo "server first so a Cloudflare flap doesn't take your DNS with it."
         elif [[ $(fc tcp_443) -gt 0 ]]; then
             echo "VERDICT: TCP broken while ICMP and DNS worked — raw TCP connects to"
             echo "port 443 failed. This matches your earlier outage (ping + dig OK, no"
