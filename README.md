@@ -84,6 +84,19 @@ Host-install paths: log at `~/.local/share/netwatch/netwatch.log`, one
 report per outage in `~/.local/share/netwatch/incidents/`, live view via
 `journalctl --user -u netwatch -f`.
 
+netwatch can only observe the WAN while it is running, so a host reboot or
+power loss is a blind spot, not an internet outage. To keep that gap from
+being misread, it refreshes a `last-alive` timestamp every cycle and writes a
+`last-clean-shutdown` marker when it receives `SIGTERM`/`SIGINT` (a graceful
+`systemctl stop`/reboot). On the next start it logs one of:
+
+- `previous shutdown was CLEAN …` — graceful stop; host was simply off.
+- `UNCLEAN restart …` — no marker, so power loss or crash; the gap's WAN
+  status is unknown.
+
+Either way it is explicitly **not** counted as a detected internet incident —
+no report is opened for netwatch's own downtime.
+
 ## Configuration (env vars)
 
 | Variable | Default | Purpose |

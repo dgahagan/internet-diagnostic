@@ -34,6 +34,16 @@ NTFY_URL="${NETWATCH_NTFY_URL:-}"
 INCIDENT_DIR="$DATA_DIR/incidents"
 LOG_FILE="$DATA_DIR/netwatch.log"
 
+# Liveness markers. LAST_ALIVE_FILE is refreshed every probe cycle, so it
+# bounds the moment netwatch stopped to within one INTERVAL. SHUTDOWN_MARKER is
+# written only on a graceful stop (SIGTERM/SIGINT). On the next start the gap
+# between them tells us whether the host was shut down cleanly or lost power /
+# crashed — either way it's netwatch's own downtime, NOT an internet outage,
+# because nothing was probing the WAN during the gap.
+LAST_ALIVE_FILE="$DATA_DIR/last-alive"
+SHUTDOWN_MARKER="$DATA_DIR/last-clean-shutdown"
+STAMP_FMT='+%s %Y-%m-%dT%H:%M:%S%z'
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 log() { printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$LOG_FILE"; }
@@ -365,6 +375,50 @@ incident_close() {
 }
 
 # ---------------------------------------------------------------------------
+# Liveness / clean-shutdown markers
+# ---------------------------------------------------------------------------
+
+# Refreshed every cycle: "netwatch was alive and probing as of this time".
+touch_alive() { date "$STAMP_FMT" > "$LAST_ALIVE_FILE" 2>/dev/null || true; }
+
+# SIGTERM is what systemd sends on `stop`/reboot/`shutdown`; SIGINT is Ctrl-C.
+# Writing the marker here is what makes a graceful stop distinguishable from a
+# power cut — on a real power loss this handler never gets to run.
+mark_clean_shutdown() {
+    date "$STAMP_FMT" > "$SHUTDOWN_MARKER" 2>/dev/null || true
+    log "shutdown signal received — wrote clean-shutdown marker; exiting"
+    exit 0
+}
+
+# Run once at startup: classify the just-ended downtime from the two markers
+# plus the kernel boot time, and log a verdict. Always consumes (deletes) the
+# shutdown marker so it can't be reused by a later unclean boot.
+report_startup_gap() {
+    local now alive_epoch alive_iso shut_epoch shut_iso gap
+    now=$(date +%s)
+
+    if [[ ! -r $LAST_ALIVE_FILE ]]; then
+        log "no prior last-alive marker — first run or fresh data dir; nothing to classify"
+        return
+    fi
+    read -r alive_epoch alive_iso < "$LAST_ALIVE_FILE"
+
+    if [[ -r $SHUTDOWN_MARKER ]]; then
+        read -r shut_epoch shut_iso < "$SHUTDOWN_MARKER"
+        rm -f "$SHUTDOWN_MARKER"
+        # Valid only if the graceful stop happened at/after the last probe cycle.
+        if [[ -n ${shut_epoch:-} && ${shut_epoch} =~ ^[0-9]+$ && $shut_epoch -ge $alive_epoch ]]; then
+            gap=$(( now - shut_epoch ))
+            log "previous shutdown was CLEAN at $shut_iso — host powered off for ~${gap}s before this start; not an internet outage"
+            return
+        fi
+    fi
+
+    gap=$(( now - alive_epoch ))
+    log "UNCLEAN restart — netwatch last alive $alive_iso with no valid clean-shutdown marker (power loss or crash). Internet status during this ~${gap}s gap is UNKNOWN — NOT a detected internet outage."
+}
+
+# ---------------------------------------------------------------------------
 # Modes
 # ---------------------------------------------------------------------------
 
@@ -391,10 +445,13 @@ run_once() {
 
 run_daemon() {
     mkdir -p "$DATA_DIR" "$INCIDENT_DIR"
+    trap mark_clean_shutdown TERM INT
     log "netwatch started — gateway=$GATEWAY interval=${INTERVAL}s dig=$HAS_DIG ipv6=$HAS_V6 probes: ${PROBES[*]}"
+    report_startup_gap
     local clean_streak=0 heartbeat=0
     while true; do
         run_cycle
+        touch_alive
         if [[ -z $INCIDENT_FILE ]]; then
             [[ ${#CYCLE_FAILED[@]} -gt 0 ]] && confirm_failures
             if [[ ${#CYCLE_FAILED[@]} -gt 0 ]]; then
