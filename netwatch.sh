@@ -143,6 +143,14 @@ confirm_failures() {
     [[ ${#still[@]} -gt 0 ]] && CYCLE_FAILED=("${still[@]}")
 }
 
+# The router's DNS forwarder dropping a single query is common, self-healing
+# noise — it shows up as a lone dns_router miss that's gone the next cycle and
+# rarely affects real browsing (the system resolver often isn't the gateway).
+# True for a confirmed-failure cycle whose ONLY failing probe is dns_router.
+dns_router_only() {
+    [[ $HAS_DIG -eq 1 && ${#CYCLE_FAILED[@]} -eq 1 && ${CYCLE_FAILED[0]} == dns_router ]]
+}
+
 cycle_matrix_line() {
     local p marks=""
     for p in "${PROBES[@]}"; do
@@ -448,17 +456,27 @@ run_daemon() {
     trap mark_clean_shutdown TERM INT
     log "netwatch started — gateway=$GATEWAY interval=${INTERVAL}s dig=$HAS_DIG ipv6=$HAS_V6 probes: ${PROBES[*]}"
     report_startup_gap
-    local clean_streak=0 heartbeat=0
+    local clean_streak=0 heartbeat=0 dns_router_pending=0
     while true; do
         run_cycle
         touch_alive
         if [[ -z $INCIDENT_FILE ]]; then
             [[ ${#CYCLE_FAILED[@]} -gt 0 ]] && confirm_failures
             if [[ ${#CYCLE_FAILED[@]} -gt 0 ]]; then
-                incident_open
-                incident_record_cycle
-                clean_streak=0
+                # Debounce a lone dns_router miss: require it to fail two
+                # consecutive cycles before opening an incident. A genuine
+                # forwarder outage persists; a one-off blip is gone next cycle.
+                if dns_router_only && (( dns_router_pending == 0 )); then
+                    dns_router_pending=1
+                    log "dns_router single miss — debouncing one cycle before opening"
+                else
+                    dns_router_pending=0
+                    incident_open
+                    incident_record_cycle
+                    clean_streak=0
+                fi
             else
+                dns_router_pending=0
                 heartbeat=$((heartbeat + 1))
                 # one log line per ~hour so the journal shows it's alive
                 if (( heartbeat * INTERVAL >= 3600 )); then
