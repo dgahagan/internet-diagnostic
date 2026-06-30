@@ -99,6 +99,17 @@ no report is opened for netwatch's own downtime.
 
 ## Configuration (env vars)
 
+Machine-specific settings (your LAN ntfy URL, etc.) live in a gitignored
+`.env`. Copy the template and edit it:
+
+```sh
+cp .env.example .env
+```
+
+docker-compose auto-loads `.env`; the desktop subscriber (`ntfy-toast.sh`)
+sources a sibling `.env` if present. You can also set any of these directly in
+the environment, which always overrides `.env`:
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `NETWATCH_INTERVAL` | `5` | seconds between probe cycles |

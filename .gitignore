@@ -2,5 +2,11 @@ data/
 ntfy-cache/
 *.log
 
+# local machine-specific config (LAN IPs, topic URLs) — copy .env.example
+.env
+
 # machine-specific deployment notes, not for publishing
 docs/HOMELAB.md
+
+# machine-specific incident log (contains local IPs/traceroutes), not for publishing
+docs/ISP-INCIDENT-LOG.md

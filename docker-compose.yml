@@ -14,9 +14,10 @@ services:
     network_mode: host
     restart: unless-stopped
     environment:
-      # Uncomment to push incident alerts to a LAN ntfy topic:
-      # NETWATCH_NTFY_URL: http://<lan-ip>:8090/internet-alerts
-      NETWATCH_INTERVAL: 5
+      # Configured via .env (copy .env.example). Set NETWATCH_NTFY_URL there to
+      # push incident alerts to a LAN ntfy topic; blank disables push.
+      NETWATCH_NTFY_URL: ${NETWATCH_NTFY_URL:-}
+      NETWATCH_INTERVAL: ${NETWATCH_INTERVAL:-5}
     volumes:
       - ./data:/data:z
 

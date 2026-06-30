@@ -16,10 +16,23 @@
 #   ntfy-toast.sh                         # uses the env defaults below
 #   NTFY_SERVER=http://192.168.1.100:8090 NTFY_TOPIC=internet-alerts ntfy-toast.sh
 #
+# Config: set NTFY_SERVER / NTFY_TOPIC in the environment, or in a `.env` file
+# next to this script (copy .env.example). The environment wins over .env.
+#
 # Autostart (Linux): install as a systemd user service — see ntfy-toast.service.
 # Autostart (macOS): use a launchd LaunchAgent — see the README.
 
 set -u
+
+# Load a sibling .env if present, as defaults — the environment (and systemd
+# Environment= / inline VAR=... overrides) always wins over .env.
+ENV_FILE="$(dirname "$0")/.env"
+if [[ -f $ENV_FILE ]]; then
+    while IFS='=' read -r key val; do
+        [[ $key == \#* || -z $key ]] && continue
+        [[ -z ${!key:-} ]] && export "$key=$val"
+    done < "$ENV_FILE"
+fi
 
 SERVER="${NTFY_SERVER:-http://192.168.1.100:8090}"
 TOPIC="${NTFY_TOPIC:-internet-alerts}"
