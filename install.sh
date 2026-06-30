@@ -13,7 +13,10 @@ install -m 755 netwatch.sh ~/bin/netwatch.sh
 install -m 644 netwatch.service ~/.config/systemd/user/netwatch.service
 
 systemctl --user daemon-reload
-systemctl --user enable --now netwatch
+systemctl --user enable netwatch
+# restart (not `enable --now`) so a re-install of an already-running daemon
+# actually picks up the new netwatch.sh instead of leaving the old one running
+systemctl --user restart netwatch
 systemctl --user status netwatch --no-pager --lines=3 || true
 
 cat <<'EOF'
