@@ -239,6 +239,35 @@ netwatch's verdict, with graphs.
 Caveat worth knowing: a suspend/resume or a deliberate router reboot looks
 like an incident — check report timestamps against what you were doing.
 
+## Prior art & how netwatch differs
+
+The "is my internet down / log my ISP outages" space is well-trodden. netwatch
+isn't trying to be another up/down logger or a metrics dashboard — its niche is
+**cross-probe classification** (naming *which layer* broke) plus
+**internet-independent alerting**. If that's not what you need, reach for a
+mature tool instead:
+
+- **Latency/loss graphing over time** → [SmokePing](https://github.com/oetiker/SmokePing)
+- **Dashboards / full metrics stack** → [internet-monitoring](https://github.com/maxandersen/internet-monitoring) or [internet-pi](https://github.com/geerlingguy/internet-pi) (Prometheus + Grafana + blackbox-exporter)
+- **Service/status-page uptime monitoring** → [Uptime Kuma](https://github.com/louislam/uptime-kuma), [Gatus](https://github.com/TwiN/gatus)
+- **Plain ping logging for an ISP support case** → [pinguno](https://github.com/twome/pinguno)
+
+The closest neighbors each capture *one* of netwatch's ideas but not the whole:
+[WirePeep](https://github.com/menees/WirePeep) checks layered targets (gateway /
+public DNS / modem) but is a Windows GUI that reports downtime windows, not
+verdicts; [wanstatus](https://github.com/cjnaz/wanstatus) splits WAN from LAN but
+alerts over (internet-dependent) email/SMS;
+[gitbls/internet-monitor](https://github.com/gitbls/internet-monitor) ships as a
+systemd service with action hooks but does no classification and no LAN-local
+push.
+
+What I haven't found packaged together elsewhere: the **DNS-hijack / VPN-resolver
+redirection** and **Cloudflare-only (partial-anycast) routing** verdicts,
+**LAN-hosted alerting by design** so notifications survive the outage they
+report, and **self-downtime accounting** (liveness markers so time the host was
+off is never logged as an internet outage) — all as a single ~500-line bash
+script running as a systemd *user* service on an immutable distro.
+
 ## License
 
 MIT
