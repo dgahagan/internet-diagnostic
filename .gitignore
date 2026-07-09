@@ -10,3 +10,6 @@ docs/HOMELAB.md
 
 # machine-specific incident log (contains local IPs/traceroutes), not for publishing
 docs/ISP-INCIDENT-LOG.md
+
+# python bytecode from running web/ locally
+__pycache__/

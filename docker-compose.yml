@@ -21,6 +21,26 @@ services:
     volumes:
       - ./data:/data:z
 
+  # LAN dashboard: live status, incident browser, and remediation playbooks
+  # matched to the failing-probe signature. Read-only view of the netwatch
+  # data dir — point NETWATCH_DATA_DIR at wherever netwatch writes (the
+  # systemd deployment uses ~/.local/share/netwatch; the compose one ./data).
+  #
+  #   docker compose up -d --build web
+  web:
+    build: ./web
+    image: netwatch-web
+    container_name: netwatch-web
+    restart: unless-stopped
+    ports:
+      - "${NETWATCH_WEB_PORT:-8091}:8091"
+    environment:
+      NETWATCH_INTERVAL: ${NETWATCH_INTERVAL:-5}
+      NETWATCH_WEB_IFACE: ${NETWATCH_WEB_IFACE:-}
+      NETWATCH_WEB_LAN_DNS: ${NETWATCH_WEB_LAN_DNS:-}
+    volumes:
+      - ${NETWATCH_DATA_DIR:-./data}:/data:ro,z
+
   # Optional self-hosted push server for phone alerts (ntfy Android app with
   # "instant delivery" works fully offline-from-the-internet on your LAN).
   ntfy:

@@ -115,6 +115,34 @@ the environment, which always overrides `.env`:
 | `NETWATCH_INTERVAL` | `5` | seconds between probe cycles |
 | `NETWATCH_DIR` | `~/.local/share/netwatch` | data directory |
 | `NETWATCH_NTFY_URL` | *(off)* | ntfy topic URL for push alerts, e.g. `http://<lan-ip>:8090/internet-alerts` |
+| `NETWATCH_DATA_DIR` | `./data` | (web dashboard) host path of the data dir to mount |
+| `NETWATCH_WEB_PORT` | `8091` | (web dashboard) host port |
+| `NETWATCH_WEB_IFACE` | *(placeholder)* | (web dashboard) LAN interface used in rendered fix commands |
+| `NETWATCH_WEB_LAN_DNS` | *(placeholder)* | (web dashboard) LAN DNS servers used in rendered fix commands |
+
+## Web dashboard
+
+A small LAN-only dashboard (`web/`, stdlib Python, no dependencies) renders
+the netwatch data dir read-only:
+
+- **Live status banner** — green/red from the `last-alive` marker and any
+  open incident, auto-refreshing every 5 s; a third state calls out when
+  netwatch *itself* isn't running (internet state unknown ≠ outage).
+- **Playbooks** — each incident's failing-probe set is matched against a
+  knowledge base of known failure signatures (VPN DNS wipe, WAN outage,
+  provider-only loss, conntrack, MTU, …) and the dashboard shows the
+  diagnosis plus copy-pasteable fix commands *while the outage is
+  happening*. Set `NETWATCH_WEB_IFACE`/`NETWATCH_WEB_LAN_DNS` in `.env` so
+  the commands come out ready to paste.
+- **Incident browser** — every report with verdict, timeline, and snapshot;
+  incidents interrupted by a reboot are labeled as such.
+
+```sh
+docker compose up -d --build web     # http://<lan-ip>:8091
+```
+
+Being LAN-hosted it stays reachable during an internet outage — same
+reasoning as the LAN ntfy server.
 
 ## Alerts
 
