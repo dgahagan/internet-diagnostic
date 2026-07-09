@@ -4,7 +4,7 @@ FROM python:3.12-slim
 # (which is rather the point of this project).
 
 WORKDIR /app
-COPY app.py playbooks.py ./
+COPY app.py playbooks.py probes.py ./
 
 ENV NETWATCH_DIR=/data
 EXPOSE 8091

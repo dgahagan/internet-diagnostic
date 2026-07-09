@@ -20,6 +20,18 @@
 #                       Point it at a LAN-hosted ntfy server — an internet
 #                       service can't deliver alerts about the internet being
 #                       down.
+#   NETWATCH_SERVICE_PROBES
+#                       optional third-party service probes, space/comma-
+#                       separated name=url pairs (default: off), e.g.
+#                         claude=statuspage:https://status.claude.com
+#                       A "statuspage:" prefix queries the statuspage.io v2
+#                       API and maps the provider's indicator: "none" = up,
+#                       "minor"/"maintenance" = degraded, "major"/"critical"
+#                       (or API unreachable) = down. A plain http(s) url is a
+#                       binary reachability check (up/down only).
+#                       Informational only: shown on the web dashboard, never
+#                       opens incidents, never alerts — answers "is it me or
+#                       them?" when a SaaS you rely on is having a bad day.
 
 set -u
 
@@ -108,6 +120,124 @@ probe_https_ip()        { curl -s -o /dev/null --max-time "$CURL_TIMEOUT" https:
 probe_https_v6()        { curl -6 -s -o /dev/null --max-time "$CURL_TIMEOUT" https://www.google.com/generate_204; }
 
 # ---------------------------------------------------------------------------
+# Service probes — optional, user-defined, informational only
+# ---------------------------------------------------------------------------
+# Parsed from NETWATCH_SERVICE_PROBES (see header). Deliberately separate
+# from PROBES: service results never touch CYCLE_FAILED, incidents, verdicts,
+# or notifications — a SaaS outage is not an internet outage. Current state
+# is published to $SERVICE_STATUS_FILE for the web dashboard, and probing is
+# paced to roughly every 30s (statuspage APIs cache ~60s; probing a third
+# party every 5s is rude and buys nothing).
+
+SERVICE_STATUS_FILE="$DATA_DIR/service-status"
+SERVICE_DOWN_CYCLES=2   # consecutive non-up service cycles before leaving "up"
+SERVICE_EVERY=$(( (30 + INTERVAL - 1) / INTERVAL ))
+(( SERVICE_EVERY < 1 )) && SERVICE_EVERY=1
+
+SERVICE_NAMES=()
+declare -A SERVICE_URL SERVICE_KIND SERVICE_STATE SERVICE_SINCE SERVICE_STREAK \
+           SERVICE_CYCLE_RESULT
+SERVICE_DUE=0
+SERVICE_SUSPENDED=0
+
+parse_service_probes() {
+    local raw="${NETWATCH_SERVICE_PROBES:-}" pairs=() pair name url kind
+    raw=${raw//,/ }
+    # read -ra never glob-expands — URLs legitimately contain ? and *
+    read -ra pairs <<< "$raw" || true
+    for pair in "${pairs[@]}"; do
+        [[ -z $pair ]] && continue
+        name=${pair%%=*}      # split on the FIRST = only; query strings have =
+        url=${pair#*=}
+        if [[ $pair != *=* || ! $name =~ ^[A-Za-z0-9_-]+$ || -z $url ]]; then
+            log "service probe skipped — malformed entry: $pair"
+            continue
+        fi
+        kind=https
+        [[ $url == statuspage:* ]] && { kind=statuspage; url=${url#statuspage:}; }
+        if [[ $url != http://* && $url != https://* ]]; then
+            log "service probe skipped — not an http(s) url: $pair"
+            continue
+        fi
+        SERVICE_NAMES+=("$name")
+        SERVICE_URL[$name]=${url%/}
+        SERVICE_KIND[$name]=$kind
+        SERVICE_STATE[$name]=up
+        SERVICE_SINCE[$name]=$(date +%s)
+        SERVICE_STREAK[$name]=0
+    done
+}
+mkdir -p "$DATA_DIR"   # parse may log() before run_daemon's mkdir
+parse_service_probes
+
+# Prints the observed level on stdout: up | degraded | down.
+probe_service() {
+    local url=${SERVICE_URL[$1]} ind
+    if [[ ${SERVICE_KIND[$1]} == statuspage ]]; then
+        # No jq in the minimal image — whitespace-tolerant grep handles both
+        # compact and pretty-printed statuspage JSON.
+        ind=$(curl -s --max-time "$CURL_TIMEOUT" "$url/api/v2/status.json" \
+            | grep -Eo '"indicator"[[:space:]]*:[[:space:]]*"[a-z]+"' | head -n1)
+        ind=${ind%\"}; ind=${ind##*\"}
+        case $ind in
+            none)              echo up ;;
+            minor|maintenance) echo degraded ;;
+            *)                 echo down ;;   # major/critical, unreachable, unparseable
+        esac
+    else
+        # Plain reachability has no degraded signal to read — binary only.
+        if curl -s -o /dev/null --max-time "$CURL_TIMEOUT" "$url"; then
+            echo up
+        else
+            echo down
+        fi
+    fi
+}
+
+service_update_states() {
+    local s observed prev
+    for s in "${SERVICE_NAMES[@]}"; do
+        observed=${SERVICE_CYCLE_RESULT[$s]:-down}
+        prev=${SERVICE_STATE[$s]}
+        if [[ $observed == up ]]; then
+            if [[ $prev != up ]]; then
+                log "SERVICE UP — $s after ~$(( $(date +%s) - ${SERVICE_SINCE[$s]} ))s"
+                SERVICE_SINCE[$s]=$(date +%s)
+            fi
+            SERVICE_STATE[$s]=up
+            SERVICE_STREAK[$s]=0
+        else
+            # Debounce leaving "up"; once non-up, follow the observed level
+            # directly (degraded<->down needs no second confirmation).
+            SERVICE_STREAK[$s]=$(( ${SERVICE_STREAK[$s]} + 1 ))
+            if [[ $prev != "$observed" ]] && (( ${SERVICE_STREAK[$s]} >= SERVICE_DOWN_CYCLES )); then
+                SERVICE_STATE[$s]=$observed
+                SERVICE_SINCE[$s]=$(date +%s)
+                log "SERVICE ${observed^^} — $s (${SERVICE_KIND[$s]} ${SERVICE_URL[$s]}) — informational, not an internet incident"
+            fi
+        fi
+    done
+}
+
+# Atomic publish for the dashboard (which reads the data dir from another
+# container): temp file in the SAME directory so mv is a rename, not a copy.
+# Header line = write time; then one line per service:
+#   name state since_epoch kind url        (state: up|degraded|down|unknown)
+write_service_status() {
+    local tmp="$SERVICE_STATUS_FILE.tmp" s state
+    {
+        date "$STAMP_FMT"
+        for s in "${SERVICE_NAMES[@]}"; do
+            state=${SERVICE_STATE[$s]}
+            (( SERVICE_SUSPENDED )) && state=unknown
+            printf '%s %s %s %s %s\n' "$s" "$state" "${SERVICE_SINCE[$s]}" \
+                "${SERVICE_KIND[$s]}" "${SERVICE_URL[$s]}"
+        done
+    } > "$tmp" 2>/dev/null || return 0
+    mv -f "$tmp" "$SERVICE_STATUS_FILE" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 # Probe cycle — all probes in parallel; cycle time is bounded by the slowest
 # timeout (~5s), not the sum.
 # ---------------------------------------------------------------------------
@@ -121,6 +251,15 @@ run_cycle() {
         ( "probe_$p" >/dev/null 2>&1 && : > "$tmp/$p.ok" ) &
         pids+=($!)
     done
+    # Service probes join the same parallel batch on their due cycles but
+    # collect into their own result set — never CYCLE_FAILED. The svc.
+    # marker prefix avoids collisions with internet-probe names.
+    if (( SERVICE_DUE )); then
+        for p in "${SERVICE_NAMES[@]}"; do
+            ( probe_service "$p" > "$tmp/svc.$p.result" 2>/dev/null ) &
+            pids+=($!)
+        done
+    fi
     # wait on probe pids only — a bare `wait` would also block on the
     # background snapshot job and stall probing mid-incident
     wait "${pids[@]}"
@@ -128,6 +267,14 @@ run_cycle() {
     for p in "${PROBES[@]}"; do
         [[ -e "$tmp/$p.ok" ]] || CYCLE_FAILED+=("$p")
     done
+    if (( SERVICE_DUE )); then
+        local r
+        for p in "${SERVICE_NAMES[@]}"; do
+            r=$(cat "$tmp/svc.$p.result" 2>/dev/null)
+            [[ $r == up || $r == degraded || $r == down ]] || r=down
+            SERVICE_CYCLE_RESULT[$p]=$r
+        done
+    fi
     rm -rf "$tmp"
 }
 
@@ -433,13 +580,22 @@ report_startup_gap() {
 run_once() {
     echo "netwatch one-shot — gateway=$GATEWAY dig=$HAS_DIG ipv6=$HAS_V6"
     echo
+    SERVICE_DUE=1
     run_cycle
-    local p
+    local p state f
     for p in "${PROBES[@]}"; do
-        local state="OK" f
+        state="OK"
         for f in "${CYCLE_FAILED[@]:-}"; do [[ $f == "$p" ]] && state="FAIL"; done
         printf '  %-18s %s\n' "$p" "$state"
     done
+    if (( ${#SERVICE_NAMES[@]} )); then
+        echo
+        echo "  service probes (informational — never affect incidents or exit code):"
+        for p in "${SERVICE_NAMES[@]}"; do
+            state=${SERVICE_CYCLE_RESULT[$p]:-down}
+            printf '  %-18s %s  (%s %s)\n' "$p" "${state^^}" "${SERVICE_KIND[$p]}" "${SERVICE_URL[$p]}"
+        done
+    fi
     echo
     if [[ ${#CYCLE_FAILED[@]} -eq 0 ]]; then
         echo "All probes passed."
@@ -448,18 +604,45 @@ run_once() {
     fi
     echo
     snapshot
+    # exit code is internet-only by design — a down third-party service must
+    # not make --once report your network as broken
     [[ ${#CYCLE_FAILED[@]} -eq 0 ]]
 }
 
 run_daemon() {
     mkdir -p "$DATA_DIR" "$INCIDENT_DIR"
     trap mark_clean_shutdown TERM INT
+    # NOTE: services must NOT be appended to the "probes:" list below — the
+    # web dashboard parses that suffix as the internet-probe set.
     log "netwatch started — gateway=$GATEWAY interval=${INTERVAL}s dig=$HAS_DIG ipv6=$HAS_V6 probes: ${PROBES[*]}"
+    if (( ${#SERVICE_NAMES[@]} )); then
+        log "service probes (informational, ~every $(( SERVICE_EVERY * INTERVAL ))s): ${SERVICE_NAMES[*]}"
+    else
+        # a file left by a previous config would render ghost chips forever
+        rm -f "$SERVICE_STATUS_FILE"
+    fi
     report_startup_gap
-    local clean_streak=0 heartbeat=0 dns_router_pending=0
+    local clean_streak=0 heartbeat=0 dns_router_pending=0 cycle_i=0
     while true; do
+        SERVICE_DUE=0
+        (( ${#SERVICE_NAMES[@]} )) && (( cycle_i % SERVICE_EVERY == 0 )) && SERVICE_DUE=1
+        cycle_i=$(( cycle_i + 1 ))
         run_cycle
         touch_alive
+        # Service state updates run against the RAW cycle results, before
+        # confirm_failures mutates CYCLE_FAILED. While any internet probe is
+        # failing (or an incident is open) service results are meaningless —
+        # everything fails when the WAN is down — so publish "unknown" and
+        # freeze the service state machine instead of screaming SERVICE DOWN.
+        if (( ${#SERVICE_NAMES[@]} )); then
+            if [[ ${#CYCLE_FAILED[@]} -gt 0 || -n $INCIDENT_FILE ]]; then
+                SERVICE_SUSPENDED=1
+            else
+                SERVICE_SUSPENDED=0
+                (( SERVICE_DUE )) && service_update_states
+            fi
+            write_service_status
+        fi
         if [[ -z $INCIDENT_FILE ]]; then
             [[ ${#CYCLE_FAILED[@]} -gt 0 ]] && confirm_failures
             if [[ ${#CYCLE_FAILED[@]} -gt 0 ]]; then

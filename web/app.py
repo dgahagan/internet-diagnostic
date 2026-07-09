@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import playbooks
+import probes
 
 DATA_DIR = os.environ.get("NETWATCH_DIR", "/data")
 INCIDENT_DIR = os.path.join(DATA_DIR, "incidents")
@@ -46,6 +47,30 @@ def read_last_alive():
         return None, None
 
 
+SERVICE_STATUS = os.path.join(DATA_DIR, "service-status")
+
+
+def read_service_status():
+    """Parse the service-status file netwatch publishes atomically each cycle.
+    Header: 'epoch iso'; then 'name state since_epoch kind url' per service
+    (url is last so split(None, 4) keeps query strings intact).
+    Missing/malformed file = feature off."""
+    try:
+        with open(SERVICE_STATUS) as f:
+            lines = f.read().splitlines()
+        ts = int(lines[0].split()[0])
+        out = []
+        for line in lines[1:]:
+            parts = line.split(None, 4)
+            if len(parts) == 5:
+                name, state, since, kind, url = parts
+                out.append({"name": name, "state": state, "since": int(since),
+                            "kind": kind, "url": url})
+        return ts, out
+    except (OSError, ValueError, IndexError):
+        return None, []
+
+
 def log_tail(n=25):
     try:
         with open(LOG_FILE, "rb") as f:
@@ -56,6 +81,23 @@ def log_tail(n=25):
         return lines[-n:]
     except OSError:
         return []
+
+
+def active_probes():
+    """The probe set this instance actually runs, from the most recent
+    'netwatch started — ... probes: ...' log line (dns_router/dns_public and
+    https_v6 are conditional). Falls back to the unconditional set."""
+    try:
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 1024 * 1024))
+            lines = f.read().decode(errors="replace").splitlines()
+        for line in reversed(lines):
+            if "netwatch started — " in line and " probes: " in line:
+                return line.rsplit(" probes: ", 1)[1].split()
+    except OSError:
+        pass
+    return [p["id"] for p in probes.PROBES if "requires" not in p]
 
 
 def parse_incident(path):
@@ -138,6 +180,21 @@ def get_status():
         "checked_at": int(now),
     }
 
+    # Service probes (informational): gray them out when netwatch is stale,
+    # when their file is stale (old binary left it behind), or when netwatch
+    # suspended them because the internet itself is failing.
+    svc_ts, svc = read_service_status()
+    svc_fresh = fresh and svc_ts is not None and now - svc_ts < STALE_SECS
+    for s in svc:
+        s["display"] = ("unk" if not svc_fresh or s["state"] == "unknown"
+                        else "bad" if s["state"] == "down"
+                        else "warn" if s["state"] == "degraded" else "ok")
+    status["services"] = svc
+    status["services_down"] = sorted(
+        s["name"] for s in svc if s["display"] == "bad")
+    status["services_degraded"] = sorted(
+        s["name"] for s in svc if s["display"] == "warn")
+
     if not fresh:
         status["state"] = "stale"
         if epoch is None:
@@ -195,6 +252,17 @@ nav h1 { font-size:1.2rem; margin:0; } nav a { color:var(--muted); }
 .sev.ignore{background:var(--ok);} .sev.info{background:var(--muted);}
 .loc { font-size:.75rem; padding:.1rem .5rem; border-radius:99px;
        border:1px solid var(--warn); color:var(--warn); vertical-align:middle; }
+.pgrid { display:flex; flex-direction:column; gap:.35rem; margin:0 0 1.2rem; }
+.prow { display:flex; align-items:baseline; gap:.5rem; flex-wrap:wrap; }
+.prow .lay { color:var(--muted); font-size:.75rem; width:5.5rem;
+             text-transform:uppercase; letter-spacing:.05em; flex-shrink:0; }
+.pchip { display:inline-flex; align-items:center; gap:.35rem; padding:.15rem .6rem;
+         border:1px solid var(--border); border-radius:99px; font-size:.8rem;
+         text-decoration:none; background:var(--card); }
+.dot { width:.55rem; height:.55rem; border-radius:50%; display:inline-block; }
+.dot.ok{background:var(--ok);} .dot.bad{background:var(--bad);}
+.dot.warn{background:var(--warn);} .dot.unk{background:var(--muted);}
+.inactive { color:var(--muted); }
 table { border-collapse:collapse; width:100%; font-size:.9rem; }
 th,td { text-align:left; padding:.35rem .6rem; border-bottom:1px solid var(--border); }
 td.v { color:var(--muted); }
@@ -230,8 +298,12 @@ async function poll() {
     // Reload on any state change, and mid-outage whenever the failing-probe
     // set shifts so the chips and matched playbook never go stale.
     // Only the dashboard stamps data-sig; detail pages never auto-reload.
+    // MUST build the same string as render_index()'s sig or the page either
+    // reload-loops or never updates.
     const cur = document.body.dataset.sig;
-    const sig = s.state + '|' + (s.failing || []).join(',');
+    const sig = s.state + '|' + (s.failing || []).join(',')
+              + '|' + (s.services_down || []).join(',')
+              + '|' + (s.services_degraded || []).join(',');
     if (cur !== undefined && sig !== cur) { location.reload(); return; }
     if (s.alive_age !== null) { ageBase = s.alive_age; ageT0 = Date.now(); tick(); }
   } catch (e) { /* server briefly unreachable; keep trying */ }
@@ -248,6 +320,7 @@ def page(title, body, sig=None):
 <title>{html.escape(title)}</title><style>{STYLE}</style></head>
 <body{sig_attr}>
 <nav><h1>netwatch</h1><a href="/">status</a>
+<a href="/probes">probes</a>
 <a href="/playbooks">playbooks</a></nav>
 {body}
 <footer>netwatch-web — data dir mounted read-only; probes every {INTERVAL}s.
@@ -274,6 +347,34 @@ def render_playbook_card(pb, compact=False):
             f'<h3>{esc(pb["title"])} '
             f'<span class="sev {pb["severity"]}">{pb["severity"]}</span>{loc}</h3>'
             f'{body}<b>What to do:</b>{fixes}</div>')
+
+
+def render_probe_grid(status):
+    """Live probe chips grouped by layer. Healthy = every active probe green;
+    outage = the failing set red; netwatch stale = everything unknown."""
+    active = active_probes()
+    failing = set(status["failing"])
+    rows = ""
+    for layer in probes.LAYERS:
+        chips = ""
+        for p in probes.PROBES:
+            if p["layer"] != layer or p["id"] not in active:
+                continue
+            dot = "unk" if status["state"] == "stale" else \
+                  ("bad" if p["id"] in failing else "ok")
+            chips += (f'<a class="pchip" href="/probes#{p["id"]}" '
+                      f'title="{esc(p["target"])}">'
+                      f'<span class="dot {dot}"></span>{esc(p["id"])}</a>')
+        if chips:
+            rows += f'<div class="prow"><span class="lay">{esc(layer)}</span>{chips}</div>'
+    svc_chips = ""
+    for s in status.get("services", []):
+        svc_chips += (f'<a class="pchip" href="/probes#svc-{esc(s["name"])}" '
+                      f'title="{esc(s["url"])}">'
+                      f'<span class="dot {s["display"]}"></span>{esc(s["name"])}</a>')
+    if svc_chips:
+        rows += f'<div class="prow"><span class="lay">Services</span>{svc_chips}</div>'
+    return f'<div class="pgrid">{rows}</div>'
 
 
 def render_index():
@@ -325,8 +426,32 @@ def render_index():
     tail = "\n".join(log_tail())
     log_block = (f'<details><summary>netwatch.log tail</summary>'
                  f'<pre>{esc(tail)}</pre></details>')
-    sig = status["state"] + "|" + ",".join(status["failing"])
-    return page("netwatch status", banner + table + log_block, sig=sig)
+    # "Is it me or them?" — a service down while every internet probe is
+    # green is by definition a provider-side problem.
+    notice = ""
+    if status["state"] == "ok":
+        for s in status["services"]:
+            if s["display"] == "bad":
+                headline, detail = "is down", "a major outage"
+            elif s["display"] == "warn":
+                headline, detail = "is degraded", ("a partial degradation — "
+                                                   "some features slow or failing")
+            else:
+                continue
+            notice += (f'<div class="card"><h3>{esc(s["name"])} {headline} '
+                       f'<span class="sev wait">not your network</span>'
+                       f'</h3><p>All internet probes are green — '
+                       f'{esc(s["name"])} is reporting {detail} on their side, '
+                       f'nothing to fix locally. Status page: '
+                       f'<a href="{esc(s["url"])}">{esc(s["url"])}</a></p></div>')
+
+    grid = render_probe_grid(status)
+    # MUST mirror POLL_JS's sig expression — see the comment there.
+    sig = (status["state"] + "|" + ",".join(status["failing"])
+           + "|" + ",".join(status["services_down"])
+           + "|" + ",".join(status["services_degraded"]))
+    return page("netwatch status", banner + notice + grid + table + log_block,
+                sig=sig)
 
 
 def render_incident(name):
@@ -373,6 +498,78 @@ def render_incident(name):
     return page(name, pb_card + "\n".join(out))
 
 
+def render_probes():
+    status, _ = get_status()
+    active = active_probes()
+    failing = set(status["failing"])
+    intro = ("<p>Every few seconds netwatch runs all probes in parallel, one "
+             "per network layer, so an outage shows <i>which layer</i> broke "
+             "— not just that something did. Layers from the bottom up:</p>")
+    cards = ""
+    for layer in probes.LAYERS:
+        cards += f"<h2>{esc(layer)}</h2>"
+        for p in probes.PROBES:
+            if p["layer"] != layer:
+                continue
+            is_active = p["id"] in active
+            if not is_active:
+                state = ('<span class="loc">inactive</span> '
+                         f'<span class="inactive">needs {esc(p.get("requires", "?"))}'
+                         '</span>')
+            elif status["state"] == "stale":
+                state = '<span class="dot unk"></span>'
+            elif p["id"] in failing:
+                state = '<span class="dot bad"></span> failing now'
+            else:
+                state = '<span class="dot ok"></span> passing'
+            req = (f'<p><b>Requires:</b> {esc(p["requires"])}</p>'
+                   if "requires" in p and is_active else "")
+            cards += (f'<div class="card" id="{p["id"]}">'
+                      f'<h3>{esc(p["id"])} — {esc(p["target"])} '
+                      f'<span style="font-weight:normal;font-size:.85rem">'
+                      f'{state}</span></h3>'
+                      f'<p><b>Check:</b> {esc(p["check"])}</p>'
+                      f'<p><b>Why this layer:</b> {esc(p["why"])}</p>'
+                      f'<p><b>When it fails:</b> {esc(p["fails"])}</p>{req}</div>')
+
+    cards += "<h2>Services (user-defined)</h2>"
+    if status["services"]:
+        for s in status["services"]:
+            if s["kind"] == "statuspage":
+                check = (f'GET {s["url"]}/api/v2/status.json each service '
+                         'cycle (~30s); maps the provider\'s own indicator: '
+                         '"none" = up, "minor"/"maintenance" = degraded '
+                         '(yellow), "major"/"critical" or API unreachable '
+                         '= down.')
+            else:
+                check = (f'HTTPS reachability check of {s["url"]} (~30s). '
+                         'Binary up/down — no degraded signal to read.')
+            dot = {"ok": '<span class="dot ok"></span> passing',
+                   "warn": '<span class="dot warn"></span> degraded '
+                           '(provider-reported)',
+                   "bad": '<span class="dot bad"></span> failing now',
+                   "unk": '<span class="dot unk"></span>'}[s["display"]]
+            cards += (f'<div class="card" id="svc-{esc(s["name"])}">'
+                      f'<h3>{esc(s["name"])} — {esc(s["url"])} '
+                      f'<span style="font-weight:normal;font-size:.85rem">'
+                      f'{dot}</span></h3>'
+                      f'<p><b>Check:</b> {esc(check)}</p>'
+                      f'<p><b>Informational only:</b> service probes never '
+                      f'open incidents, never alert, and are grayed out while '
+                      f'the internet itself is failing (everything looks down '
+                      f'from a broken WAN). A red chip while the internet is '
+                      f'green means the problem is on their side — see '
+                      f'<a href="{esc(s["url"])}">their status page</a>.</p>'
+                      f'</div>')
+    cards += ('<p>Add your own with <code>NETWATCH_SERVICE_PROBES</code> in '
+              '<code>.env</code> (or the systemd drop-in), e.g. '
+              '<code>claude=statuspage:https://status.claude.com '
+              'github=statuspage:https://www.githubstatus.com</code> — the '
+              '<code>statuspage:</code> prefix reads the provider\'s own '
+              'status API; a plain URL is a reachability check.</p>')
+    return page("netwatch probes", intro + cards)
+
+
 def render_playbooks():
     cards = "".join(render_playbook_card(p) for p in playbooks.get_all())
     intro = ("<p>Known failure signatures for this network, matched "
@@ -396,6 +593,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, render_index())
         if path == "/playbooks":
             return self._send(200, render_playbooks())
+        if path == "/probes":
+            return self._send(200, render_probes())
         if path.startswith("/incident/"):
             name = os.path.basename(path[len("/incident/"):])
             if INCIDENT_NAME_RE.match(name):

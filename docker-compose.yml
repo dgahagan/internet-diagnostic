@@ -18,6 +18,7 @@ services:
       # push incident alerts to a LAN ntfy topic; blank disables push.
       NETWATCH_NTFY_URL: ${NETWATCH_NTFY_URL:-}
       NETWATCH_INTERVAL: ${NETWATCH_INTERVAL:-5}
+      NETWATCH_SERVICE_PROBES: ${NETWATCH_SERVICE_PROBES:-}
     volumes:
       - ./data:/data:z
 

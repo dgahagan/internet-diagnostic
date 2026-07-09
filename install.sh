@@ -32,4 +32,10 @@ To enable phone push alerts, add your ntfy topic URL to the service:
     [Service]
     Environment=NETWATCH_NTFY_URL=http://<lan-ip>:8090/internet-alerts
   systemctl --user restart netwatch
+
+Optional: watch third-party services too (informational, shown in the web
+dashboard, never alerts) — add to the same drop-in. Quote the value: systemd
+splits unquoted Environment= lines on spaces, so a second probe would silently
+become a separate variable:
+    Environment="NETWATCH_SERVICE_PROBES=claude=statuspage:https://status.claude.com openai=statuspage:https://status.openai.com"
 EOF
