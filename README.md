@@ -136,6 +136,12 @@ the netwatch data dir read-only:
   the commands come out ready to paste.
 - **Incident browser** — every report with verdict, timeline, and snapshot;
   incidents interrupted by a reboot are labeled as such.
+- **Local playbook overlays** — the committed playbooks are deliberately
+  generic. Drop TOML files in `playbooks.d/` (gitignored) to extend them
+  with your environment's specifics — which VPN client eats your DNS, your
+  ISP's known failure modes — or to add whole new playbooks with
+  declarative probe-match rules. Overlay entries get a `local` badge and
+  are re-read on change. Format: `playbooks.d/README.md`.
 
 ```sh
 docker compose up -d --build web     # http://<lan-ip>:8091

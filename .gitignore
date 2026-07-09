@@ -13,3 +13,6 @@ docs/ISP-INCIDENT-LOG.md
 
 # python bytecode from running web/ locally
 __pycache__/
+
+# local playbook overlays (instance-specific knowledge; keep README + sample)
+playbooks.d/*.toml

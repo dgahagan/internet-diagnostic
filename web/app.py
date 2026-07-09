@@ -193,6 +193,8 @@ nav h1 { font-size:1.2rem; margin:0; } nav a { color:var(--muted); }
        vertical-align:middle; }
 .sev.local{background:var(--bad);} .sev.wait{background:var(--warn);}
 .sev.ignore{background:var(--ok);} .sev.info{background:var(--muted);}
+.loc { font-size:.75rem; padding:.1rem .5rem; border-radius:99px;
+       border:1px solid var(--warn); color:var(--warn); vertical-align:middle; }
 table { border-collapse:collapse; width:100%; font-size:.9rem; }
 th,td { text-align:left; padding:.35rem .6rem; border-bottom:1px solid var(--border); }
 td.v { color:var(--muted); }
@@ -209,23 +211,42 @@ footer { color:var(--muted); font-size:.8rem; margin-top:2rem; }
 """
 
 POLL_JS = """
+// The age counter ticks every second between polls: ageBase is the last
+// server-reported age, ageT0 when we got it. If netwatch stalls, the number
+// visibly climbs past the probe interval until a poll flips the page to the
+// 'not reporting' state.
+const ageEl = document.getElementById('age');
+let ageBase = ageEl ? parseInt(ageEl.dataset.age0, 10) : NaN;
+let ageT0 = Date.now();
+function tick() {
+  if (ageEl && !isNaN(ageBase)) {
+    const secs = ageBase + Math.round((Date.now() - ageT0) / 1000);
+    ageEl.textContent = secs + 's ago';
+  }
+}
 async function poll() {
   try {
     const r = await fetch('/api/status'); const s = await r.json();
-    if (s.state !== document.body.dataset.state) { location.reload(); return; }
-    const el = document.getElementById('age');
-    if (el && s.alive_age !== null) el.textContent = s.alive_age + 's ago';
+    // Reload on any state change, and mid-outage whenever the failing-probe
+    // set shifts so the chips and matched playbook never go stale.
+    // Only the dashboard stamps data-sig; detail pages never auto-reload.
+    const cur = document.body.dataset.sig;
+    const sig = s.state + '|' + (s.failing || []).join(',');
+    if (cur !== undefined && sig !== cur) { location.reload(); return; }
+    if (s.alive_age !== null) { ageBase = s.alive_age; ageT0 = Date.now(); tick(); }
   } catch (e) { /* server briefly unreachable; keep trying */ }
 }
+setInterval(tick, 1000);
 setInterval(poll, 5000);
 """
 
 
-def page(title, body, state="ok"):
+def page(title, body, sig=None):
+    sig_attr = f' data-sig="{html.escape(sig)}"' if sig is not None else ""
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title><style>{STYLE}</style></head>
-<body data-state="{state}">
+<body{sig_attr}>
 <nav><h1>netwatch</h1><a href="/">status</a>
 <a href="/playbooks">playbooks</a></nav>
 {body}
@@ -248,9 +269,10 @@ def render_playbook_card(pb, compact=False):
         f'<p><b>Signature:</b> {esc(pb["signature"])}</p>'
         f'<p><b>Cause:</b> {esc(pb["cause"])}</p>'
         f'<p><b>Who\'s affected:</b> {esc(pb["just_me"])}</p>')
+    loc = ' <span class="loc">local</span>' if pb.get("local") else ""
     return (f'<div class="card" id="{pb["id"]}">'
             f'<h3>{esc(pb["title"])} '
-            f'<span class="sev {pb["severity"]}">{pb["severity"]}</span></h3>'
+            f'<span class="sev {pb["severity"]}">{pb["severity"]}</span>{loc}</h3>'
             f'{body}<b>What to do:</b>{fixes}</div>')
 
 
@@ -266,8 +288,9 @@ def render_index():
                   f'<div class="probes">{chips}</div>'
                   f'<div class="sub">report: <a href="/incident/'
                   f'{esc(status["incident"])}">{esc(status["incident"])}</a>'
-                  f' · last probe <span id="age">{status["alive_age"]}s ago'
-                  f'</span></div></div>')
+                  f' · last probe <span id="age" data-age0="{status["alive_age"]}">'
+                  f'{status["alive_age"]}s ago</span>'
+                  f' · probing every {INTERVAL}s</div></div>')
         pb = playbooks.classify(status["failing"]) or playbooks.FALLBACK
         banner += render_playbook_card(pb)
     elif status["state"] == "stale":
@@ -275,9 +298,10 @@ def render_index():
                   f'<div class="sub">{esc(status["detail"])}</div></div>')
     else:
         banner = (f'<div class="banner ok"><h2>All probes passing</h2>'
-                  f'<div class="sub">last probe <span id="age">'
-                  f'{status["alive_age"]}s ago</span> ({esc(status["alive_iso"])})'
-                  f'</div></div>')
+                  f'<div class="sub">last probe <span id="age" '
+                  f'data-age0="{status["alive_age"]}">{status["alive_age"]}s ago'
+                  f'</span> ({esc(status["alive_iso"])})'
+                  f' · probing every {INTERVAL}s</div></div>')
 
     rows = ""
     for i in incidents[:60]:
@@ -301,7 +325,8 @@ def render_index():
     tail = "\n".join(log_tail())
     log_block = (f'<details><summary>netwatch.log tail</summary>'
                  f'<pre>{esc(tail)}</pre></details>')
-    return page("netwatch status", banner + table + log_block, status["state"])
+    sig = status["state"] + "|" + ",".join(status["failing"])
+    return page("netwatch status", banner + table + log_block, sig=sig)
 
 
 def render_incident(name):
@@ -349,11 +374,11 @@ def render_incident(name):
 
 
 def render_playbooks():
-    cards = "".join(render_playbook_card(p) for p in playbooks.PLAYBOOKS)
-    cards += render_playbook_card(playbooks.FALLBACK)
+    cards = "".join(render_playbook_card(p) for p in playbooks.get_all())
     intro = ("<p>Known failure signatures for this network, matched "
              "automatically against the failing-probe set of live and past "
-             "incidents.</p>")
+             "incidents. Entries marked <span class=\"loc\">local</span> come "
+             "from this instance's <code>playbooks.d/</code> overlays.</p>")
     return page("netwatch playbooks", intro + cards)
 
 

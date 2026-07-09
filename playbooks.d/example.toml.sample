@@ -1,0 +1,11 @@
+# Example overlay: rename to something like `10-my-vpn.toml` to activate
+# (only *.toml files are loaded). See README.md in this directory for the
+# full format.
+
+extends = "vpn_dns_wipe"
+
+extra_cause = "On this network the usual culprit is <your VPN client> — its teardown script removes the DNS servers it pushed without restoring the LAN's."
+
+[[extra_fixes]]
+desc = "Reconnect the VPN with a fresh login:"
+cmd = "<your-vpn-client> connect"

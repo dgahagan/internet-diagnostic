@@ -5,20 +5,30 @@ remediation steps. classify() takes the set of failing probe names (from a
 live incident's last cycle, or a report's "First failing probes" line) and
 returns the first matching playbook.
 
-Machine-specific values (LAN interface name, LAN DNS servers) come from the
-environment so this file stays generic — set NETWATCH_WEB_IFACE and
-NETWATCH_WEB_LAN_DNS in .env.
+Two layers keep committed code generic while letting an instance carry its
+own environment knowledge:
+
+  * Machine values (LAN interface, LAN DNS) come from NETWATCH_WEB_IFACE /
+    NETWATCH_WEB_LAN_DNS so rendered fix commands are paste-ready.
+  * Local playbook overlays — TOML files in NETWATCH_PLAYBOOKS_DIR
+    (gitignored `playbooks.d/`) — can extend a built-in playbook with
+    instance-specific cause/fix detail, or add whole new playbooks with
+    declarative match rules. See playbooks.d/README.md for the format.
+    Files are re-read when they change; no restart needed.
 """
 
+import copy
 import os
+import tomllib
 
 IFACE = os.environ.get("NETWATCH_WEB_IFACE", "").strip() or "<lan-interface>"
 LAN_DNS = os.environ.get("NETWATCH_WEB_LAN_DNS", "").strip() or "<lan-dns-servers>"
+PLAYBOOKS_DIR = os.environ.get("NETWATCH_PLAYBOOKS_DIR", "/playbooks.d")
 
 # Probes that all target Cloudflare/1.1.1.1 — used to spot a provider-only loss.
 CF_SET = {"wan_ping_cf", "tcp_443", "https_ip", "https_cloudflare", "dns_public"}
 
-PLAYBOOKS = [
+BASE_PLAYBOOKS = [
     {
         "id": "lan_router",
         "title": "Router / LAN down",
@@ -44,8 +54,8 @@ PLAYBOOKS = [
         "cause": "Modem/ONT resync or an outage inside the ISP's network.",
         "just_me": "Whole household is down. Phone on mobile data works.",
         "fixes": [
-            {"desc": "Nothing to fix locally — wait it out (past ones self-healed "
-                     "in ~1–3 min)."},
+            {"desc": "Nothing to fix locally — short drops usually self-heal "
+                     "in a few minutes."},
             {"desc": "If it lasts, power-cycle the modem/ONT."},
             {"desc": "Keep the incident report (it captures an mtr mid-outage) "
                      "as evidence for your ISP."},
@@ -123,8 +133,8 @@ PLAYBOOKS = [
                      "(@1.1.1.1) works.",
         "cause": "The router's DNS forwarder (or the LAN DNS server it points "
                  "at, e.g. a Pi-hole) is down; public DNS is reachable.",
-        "just_me": "Everything on the LAN using the router/LAN resolver for DNS is "
-                   "affected.",
+        "just_me": "Everything on the LAN using the router/LAN resolver for "
+                   "DNS is affected.",
         "fixes": [
             {"desc": "Point this host at public DNS temporarily:",
              "cmd": f"sudo resolvectl dns {IFACE} 1.1.1.1 8.8.8.8"},
@@ -197,12 +207,146 @@ FALLBACK = {
     ],
 }
 
+# For closed incidents netwatch's verdict is computed over ALL incident cycles,
+# so it beats classifying from the first-fail probe set (which can be a subset
+# — e.g. a WAN outage whose first cycle only caught one WAN ping).
+_VERDICT_MAP = [
+    ("LAN problem", "lan_router"),
+    ("WAN outage", "wan_outage"),
+    ("system resolver redirected", "vpn_dns_wipe"),
+    ("DNS failure", "router_dns"),
+    ("destination-specific", "aws_blip"),
+    ("single upstream unreachable", "cloudflare_path"),
+    ("TCP broken", "tcp_broken"),
+    ("TLS/HTTP layer broken", "tls_mtu"),
+    ("transient blip", "transient_blip"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Local overlays — TOML files in PLAYBOOKS_DIR, re-read whenever they change
+# ---------------------------------------------------------------------------
+
+_cache = {"stamp": None, "merged": None, "customs": None}
+
+
+def _dir_stamp():
+    try:
+        return tuple(sorted(
+            (e.name, e.stat().st_mtime) for e in os.scandir(PLAYBOOKS_DIR)
+            if e.name.endswith(".toml") and e.is_file()))
+    except OSError:
+        return ()
+
+
+def _load_overlays():
+    """Parse overlay files -> (overrides-by-id, custom playbooks in file order).
+    A bad file is skipped with a warning in the container log, never fatal."""
+    overrides, customs = {}, []
+    for name, _ in _dir_stamp():
+        path = os.path.join(PLAYBOOKS_DIR, name)
+        try:
+            with open(path, "rb") as f:
+                doc = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            print(f"playbooks.d: skipping {name}: {e}", flush=True)
+            continue
+        if "extends" in doc:
+            overrides.setdefault(doc["extends"], []).append((name, doc))
+        elif "id" in doc and "match" in doc:
+            customs.append((name, doc))
+        else:
+            print(f"playbooks.d: skipping {name}: needs either 'extends' or "
+                  f"'id' + '[match]'", flush=True)
+    return overrides, customs
+
+
+def _apply_override(pb, doc):
+    for key in ("title", "severity", "signature", "cause", "just_me"):
+        if key in doc:
+            pb[key] = doc[key]
+    if "extra_cause" in doc:
+        pb["cause"] = pb["cause"].rstrip() + " " + doc["extra_cause"]
+    if "fixes" in doc:
+        pb["fixes"] = list(doc["fixes"])
+    if "extra_fixes" in doc:
+        pb["fixes"] = pb["fixes"] + list(doc["extra_fixes"])
+    pb["local"] = True
+
+
+def _custom_matches(match, f):
+    """Declarative match rules for custom playbooks. At least one rule must be
+    present; an empty [match] table would otherwise match every outage."""
+    if not any(k in match for k in ("exact", "all_of", "any_of", "none_of")):
+        return False
+    if "exact" in match:
+        return f == set(match["exact"])
+    if not set(match.get("all_of", [])) <= f:
+        return False
+    if set(match.get("none_of", [])) & f:
+        return False
+    if "any_of" in match and not set(match["any_of"]) & f:
+        return False
+    return True
+
+
+def _refresh():
+    stamp = _dir_stamp()
+    if stamp == _cache["stamp"]:
+        return
+    overrides, customs = _load_overlays()
+    merged = {}
+    for base in BASE_PLAYBOOKS + [FALLBACK]:
+        pb = copy.deepcopy(base)
+        for name, doc in overrides.get(pb["id"], []):
+            _apply_override(pb, doc)
+        merged[pb["id"]] = pb
+    custom_pbs = []
+    for name, doc in customs:
+        if doc["id"] in merged:
+            print(f"playbooks.d: skipping {name}: id {doc['id']!r} collides "
+                  f"with a built-in — use 'extends' instead", flush=True)
+            continue
+        pb = {"id": doc["id"],
+              "title": doc.get("title", doc["id"]),
+              "severity": doc.get("severity", "info"),
+              "signature": doc.get("signature", ""),
+              "cause": doc.get("cause", ""),
+              "just_me": doc.get("just_me", ""),
+              "fixes": list(doc.get("fixes", [])),
+              "match": doc["match"],
+              "local": True}
+        custom_pbs.append(pb)
+        merged[pb["id"]] = pb
+    _cache.update(stamp=stamp, merged=merged, customs=custom_pbs)
+
+
+def _get(pid):
+    _refresh()
+    return _cache["merged"][pid]
+
+
+def get_all():
+    """Every playbook for the /playbooks page — customs first (they match
+    first), then built-ins with any overrides applied, then the fallback."""
+    _refresh()
+    builtins = [_cache["merged"][p["id"]] for p in BASE_PLAYBOOKS]
+    return _cache["customs"] + builtins + [_cache["merged"]["unknown"]]
+
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
 
 def classify(failing):
     """Return the playbook matching a set of failing probe names."""
+    _refresh()
     f = set(failing)
     if not f:
         return None
+    for pb in _cache["customs"]:
+        if _custom_matches(pb["match"], f):
+            return pb
     if "gw_ping" in f:
         return _get("lan_router")
     if "wan_ping_cf" in f and "wan_ping_gg" in f:
@@ -225,32 +369,19 @@ def classify(failing):
     if f & {"https_google", "https_cloudflare", "https_aws", "https_ip"} \
             and "tcp_443" not in f:
         return _get("tls_mtu")
-    return FALLBACK
-
-
-def _get(pid):
-    return next(p for p in PLAYBOOKS if p["id"] == pid)
-
-
-# For closed incidents netwatch's verdict is computed over ALL incident cycles,
-# so it beats classifying from the first-fail probe set (which can be a subset
-# — e.g. a WAN outage whose first cycle only caught one WAN ping).
-_VERDICT_MAP = [
-    ("LAN problem", "lan_router"),
-    ("WAN outage", "wan_outage"),
-    ("system resolver redirected", "vpn_dns_wipe"),
-    ("DNS failure", "router_dns"),
-    ("destination-specific", "aws_blip"),
-    ("single upstream unreachable", "cloudflare_path"),
-    ("TCP broken", "tcp_broken"),
-    ("TLS/HTTP layer broken", "tls_mtu"),
-    ("transient blip", "transient_blip"),
-]
+    return _get("unknown")
 
 
 def classify_verdict(verdict_text):
     """Map a report's VERDICT line to a playbook, or None."""
+    if not verdict_text:
+        return None
+    _refresh()
+    for pb in _cache["customs"]:
+        prefix = pb["match"].get("verdict_prefix")
+        if prefix and verdict_text.startswith(prefix):
+            return pb
     for prefix, pid in _VERDICT_MAP:
-        if verdict_text and verdict_text.startswith(prefix):
+        if verdict_text.startswith(prefix):
             return _get(pid)
     return None

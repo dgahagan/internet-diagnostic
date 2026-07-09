@@ -40,6 +40,9 @@ services:
       NETWATCH_WEB_LAN_DNS: ${NETWATCH_WEB_LAN_DNS:-}
     volumes:
       - ${NETWATCH_DATA_DIR:-./data}:/data:ro,z
+      # Instance-specific playbook overlays (gitignored *.toml) — see
+      # playbooks.d/README.md. Re-read on change, no restart needed.
+      - ./playbooks.d:/playbooks.d:ro,z
 
   # Optional self-hosted push server for phone alerts (ntfy Android app with
   # "instant delivery" works fully offline-from-the-internet on your LAN).
