@@ -22,6 +22,17 @@ an internet-based alert about the internet being down never arrives.
 matched playbook shows the diagnosis and copy-pasteable fix commands — while
 the outage is still happening.*
 
+## Quick start
+
+```bash
+git clone https://github.com/dgahagan/internet-diagnostic.git && cd internet-diagnostic
+./netwatch.sh --once    # one layered diagnostic right now, nothing installed
+./install.sh            # keep it running: systemd user service, no root needed
+```
+
+Or containerized (`docker compose up -d --build`), plus the LAN dashboard
+(`docker compose up -d --build web`). Details and trade-offs below.
+
 ## The probe layers
 
 | Probe | What it tests | If only this fails... |
@@ -51,13 +62,8 @@ Runs as a systemd **user** service — no root, works on immutable distros.
 Needed: `bash`, `curl`, `ping`. Optional: `dig` (enables the per-resolver
 DNS probes), `mtr` or `traceroute` (better snapshots), `notify-send`
 (desktop popups). Everything is feature-detected; missing tools degrade
-gracefully.
-
-```bash
-git clone https://github.com/dgahagan/internet-diagnostic.git
-cd internet-diagnostic
-./install.sh
-```
+gracefully. `./install.sh` copies the script to `~/bin`, installs the unit,
+and (re)starts the service.
 
 Why host over container: the watchdog's value is seeing **exactly what your
 apps see** — same network stack, same resolver config — and desktop
@@ -209,73 +215,14 @@ looks down from a broken WAN, their state is meaningless). Configure via
 
 ## Desktop alerts on other PCs
 
-The host running netwatch gets popups directly. To get the **same alerts on
-other machines** on the home network — a Windows PC, a partner's laptop,
-etc. — subscribe them to the LAN ntfy topic. Because ntfy is on your LAN,
-these alerts are internet-independent, exactly like the phone push.
-
-> **Why not just open the ntfy web app?** Its background push needs HTTPS
-> (browser service workers won't run on a plain-HTTP LAN origin, and a
-> `192.168.x.x` address doesn't get the `localhost` exception). A browser tab
-> would only notify while it's open. The scripts in `subscribers/` instead
-> stream the topic directly and fire **native OS toasts** in the background.
-> One bonus of the streaming approach: a PC that was asleep during an outage
-> still gets the alert on wake, recovered from the ntfy server's message cache.
-
-All scripts take the server URL and topic via parameters/env; point them at
-your ntfy server (default examples use `http://192.168.1.100:8090` /
-`internet-alerts`).
-
-### Windows — `subscribers/ntfy-toast.ps1` (PowerShell + BurntToast)
-
-```powershell
-Install-Module -Name BurntToast -Scope CurrentUser      # one-time
-.\ntfy-toast.ps1 -Server http://192.168.1.100:8090 -Topic internet-alerts
-```
-
-Autostart at logon (runs hidden, survives reboots) — the script header has a
-ready-to-paste `Register-ScheduledTask` snippet.
-
-### Linux — `subscribers/ntfy-toast.sh` (notify-send)
-
-```bash
-mkdir -p ~/bin ~/.config/systemd/user
-cp subscribers/ntfy-toast.sh ~/bin/
-cp subscribers/ntfy-toast.service ~/.config/systemd/user/
-# edit the Environment= lines in the unit to point at your server/topic
-systemctl --user daemon-reload
-systemctl --user enable --now ntfy-toast
-```
-
-### macOS — `subscribers/ntfy-toast.sh` (osascript)
-
-The same script works on macOS (it auto-detects `osascript`; nothing extra to
-install). Run it directly, or autostart with a launchd LaunchAgent at
-`~/Library/LaunchAgents/com.netwatch.ntfy-toast.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.netwatch.ntfy-toast</string>
-  <key>ProgramArguments</key>
-  <array><string>/Users/you/bin/ntfy-toast.sh</string></array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>NTFY_SERVER</key><string>http://192.168.1.100:8090</string>
-    <key>NTFY_TOPIC</key><string>internet-alerts</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict></plist>
-```
-
-Then `launchctl load ~/Library/LaunchAgents/com.netwatch.ntfy-toast.plist`.
-
-> Prefer an off-the-shelf app? The official `ntfy` CLI
-> (`ntfy subscribe <url> <command>`) and the `ntfy-desktop` tray client both
-> work against a self-hosted LAN server too — the scripts above just avoid any
-> extra install and give native toasts out of the box.
+The host running netwatch gets popups directly. Other machines on the home
+network — a Windows PC, a partner's laptop — can get the **same native
+toasts** by subscribing to the LAN ntfy topic with the scripts in
+[`subscribers/`](subscribers/) (PowerShell + BurntToast on Windows;
+`notify-send`/`osascript` on Linux and macOS, with autostart recipes for
+each). Because ntfy is on your LAN, these alerts are internet-independent,
+exactly like the phone push — see
+[`subscribers/README.md`](subscribers/README.md).
 
 ## Reading a report
 
@@ -294,6 +241,9 @@ Each incident report contains:
    TLS handshake, an mtr/traceroute path, and VPN / DNS-redirect indicators
    (a tunnel address on `lo`, a `tun`/`wg` device, or a resolved `~.`
    catch-all routing domain).
+
+Caveat worth knowing: a suspend/resume or a deliberate router reboot looks
+like an incident — check report timestamps against what you were doing.
 
 ## Companion setup
 
@@ -314,9 +264,6 @@ netwatch's verdict, with graphs.
 > (`http://<kuma-host>/dashboard/<monitor-id>`). Don't trust the test
 > button — verify by making a monitor genuinely fail once (point it at
 > `192.0.2.1` briefly) and confirming the alert reaches your phone.
-
-Caveat worth knowing: a suspend/resume or a deliberate router reboot looks
-like an incident — check report timestamps against what you were doing.
 
 ## Prior art & how netwatch differs
 
@@ -344,7 +291,7 @@ What I haven't found packaged together elsewhere: the **DNS-hijack / VPN-resolve
 redirection** and **Cloudflare-only (partial-anycast) routing** verdicts,
 **LAN-hosted alerting by design** so notifications survive the outage they
 report, and **self-downtime accounting** (liveness markers so time the host was
-off is never logged as an internet outage) — all as a single ~500-line bash
+off is never logged as an internet outage) — all as a single ~700-line bash
 script running as a systemd *user* service on an immutable distro.
 
 ## Contributing
