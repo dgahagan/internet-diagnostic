@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck -S warning netwatch.sh install.sh subscribers/ntfy-toast.sh
+
+      - name: bash syntax
+        run: bash -n netwatch.sh install.sh subscribers/ntfy-toast.sh
+
+      - name: python compiles
+        run: python3 -m py_compile web/app.py web/playbooks.py web/probes.py
+
+  web-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: serve a synthetic data dir and hit every route
+        run: |
+          data=$(mktemp -d)
+          mkdir -p "$data/incidents" empty-playbooks
+          now=$(date +%s)
+          printf '%s %s\n' "$now" "$(date -Is)" > "$data/last-alive"
+          {
+            printf '%s %s\n' "$now" "$(date -Is)"
+            printf 'claude up %s statuspage https://status.claude.com\n' "$now"
+            printf 'openai degraded %s statuspage https://status.openai.com\n' "$now"
+          } > "$data/service-status"
+          echo "$(date -Is) netwatch started — gateway=192.168.1.1 interval=5s dig=1 ipv6=0 probes: gw_ping wan_ping_cf dns_system tcp_443 https_google" > "$data/netwatch.log"
+
+          NETWATCH_DIR="$data" NETWATCH_PLAYBOOKS_DIR=empty-playbooks \
+            NETWATCH_WEB_PORT=8091 python3 web/app.py &
+          sleep 2
+          for route in / /probes /playbooks /api/status; do
+            curl -sf "http://localhost:8091$route" > /dev/null
+          done
+          # three-state rendering: the degraded service must surface as "warn"
+          curl -sf http://localhost:8091/api/status \
+            | python3 -c 'import json,sys; s=json.load(sys.stdin); assert s["services_degraded"] == ["openai"], s'

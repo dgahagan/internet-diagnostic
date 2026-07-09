@@ -1,5 +1,8 @@
 # netwatch — find out *which layer* of your internet is breaking
 
+[![ci](https://github.com/dgahagan/internet-diagnostic/actions/workflows/ci.yml/badge.svg)](https://github.com/dgahagan/internet-diagnostic/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 A zero-dependency bash watchdog for diagnosing short, intermittent internet
 outages — the kind that are over before you can open a terminal, where
 "the internet is down" turns out to mean something much more specific.
@@ -12,6 +15,12 @@ writes a markdown report with a **verdict** about which layer broke. It can
 alert via desktop notification and/or push to your phone through a
 self-hosted [ntfy](https://ntfy.sh) server — deliberately LAN-only, because
 an internet-based alert about the internet being down never arrives.
+
+![dashboard during an outage: verdict, matched playbook with fix commands, failing probe highlighted](docs/dashboard-outage.png)
+
+*The LAN dashboard mid-outage: the failing layer is highlighted and the
+matched playbook shows the diagnosis and copy-pasteable fix commands — while
+the outage is still happening.*
 
 ## The probe layers
 
@@ -45,7 +54,8 @@ DNS probes), `mtr` or `traceroute` (better snapshots), `notify-send`
 gracefully.
 
 ```bash
-git clone <this-repo> && cd internet-diagnostic
+git clone https://github.com/dgahagan/internet-diagnostic.git
+cd internet-diagnostic
 ./install.sh
 ```
 
@@ -115,6 +125,7 @@ the environment, which always overrides `.env`:
 | `NETWATCH_INTERVAL` | `5` | seconds between probe cycles |
 | `NETWATCH_DIR` | `~/.local/share/netwatch` | data directory |
 | `NETWATCH_NTFY_URL` | *(off)* | ntfy topic URL for push alerts, e.g. `http://<lan-ip>:8090/internet-alerts` |
+| `NETWATCH_SERVICE_PROBES` | *(off)* | third-party service probes, `name=url` pairs; see "Service probes" below |
 | `NETWATCH_DATA_DIR` | `./data` | (web dashboard) host path of the data dir to mount |
 | `NETWATCH_WEB_PORT` | `8091` | (web dashboard) host port |
 | `NETWATCH_WEB_IFACE` | *(placeholder)* | (web dashboard) LAN interface used in rendered fix commands |
@@ -125,9 +136,17 @@ the environment, which always overrides `.env`:
 A small LAN-only dashboard (`web/`, stdlib Python, no dependencies) renders
 the netwatch data dir read-only:
 
+![dashboard healthy state: layered probe grid, services row with a degraded provider, incident history](docs/dashboard.png)
+
 - **Live status banner** — green/red from the `last-alive` marker and any
   open incident, auto-refreshing every 5 s; a third state calls out when
   netwatch *itself* isn't running (internet state unknown ≠ outage).
+- **Probe grid** — every active probe as a live chip, grouped by layer
+  (LAN → WAN ICMP → DNS → TCP → TLS/HTTP), so "all probes passing" shows
+  what is actually being checked. Each chip links to a **probes** page
+  documenting what that probe tests, why the layer exists, and what a
+  failure of that specific probe means; conditional probes (`dig`, IPv6)
+  are shown as inactive with the reason.
 - **Playbooks** — each incident's failing-probe set is matched against a
   knowledge base of known failure signatures (VPN DNS wipe, WAN outage,
   provider-only loss, conntrack, MTU, …) and the dashboard shows the
@@ -149,6 +168,32 @@ docker compose up -d --build web     # http://<lan-ip>:8091
 
 Being LAN-hosted it stays reachable during an internet outage — same
 reasoning as the LAN ntfy server.
+
+### Service probes — "is it me or them?"
+
+Optionally watch third-party services you depend on (Anthropic/Claude,
+GitHub, …) alongside the internet probes:
+
+```sh
+NETWATCH_SERVICE_PROBES="claude=statuspage:https://status.claude.com github=statuspage:https://www.githubstatus.com"
+```
+
+The `statuspage:` prefix queries the provider's own statuspage.io API
+(`/api/v2/status.json`) instead of just fetching the page — a status page's
+CDN stays up during real outages, the indicator doesn't. The indicator maps
+to three states: `none` = **up** (green), `minor`/`maintenance` =
+**degraded** (yellow), `major`/`critical` or API unreachable = **down**
+(red) — so "partial degradation" on the provider's side shows as exactly
+that, not as a false "down". A plain http(s) URL is a binary reachability
+check. Probes run ~every 30 s to be polite.
+
+Service probes are **informational by design**: they render as a
+"Services" row in the dashboard grid and a "not your network" notice when
+one is degraded or down while your internet is green — but they never open incidents,
+never alert, and gray out during a real internet outage (when everything
+looks down from a broken WAN, their state is meaningless). Configure via
+`.env` for the compose deployment or the systemd drop-in
+(`systemctl --user edit netwatch`) for the host install.
 
 ## Alerts
 
@@ -302,6 +347,12 @@ report, and **self-downtime accounting** (liveness markers so time the host was
 off is never logged as an internet outage) — all as a single ~500-line bash
 script running as a systemd *user* service on an immutable distro.
 
+## Contributing
+
+Bug reports, generic playbook signatures, and portability fixes welcome —
+see [CONTRIBUTING.md](CONTRIBUTING.md). When filing a bug, include
+`netwatch.sh --once` output; it answers most environment questions at once.
+
 ## License
 
-MIT
+[MIT](LICENSE)
