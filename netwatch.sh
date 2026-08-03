@@ -62,10 +62,12 @@ log() { printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$LOG_FILE"; }
 
 # Desktop popup — works from the systemd user service as long as the session
 # bus socket exists at its default path. Silently unavailable in containers.
+# notify-send blocks on a D-Bus round trip with no timeout of its own; if the
+# notification daemon is wedged that stalls the probe loop, so bound it.
 desktop_notify() {
     have notify-send || return 0
     DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}" \
-        notify-send --app-name=netwatch --urgency="$1" "$2" "$3" 2>/dev/null || true
+        timeout 5 notify-send --app-name=netwatch --urgency="$1" "$2" "$3" 2>/dev/null || true
 }
 
 ntfy_notify() {
@@ -290,12 +292,26 @@ confirm_failures() {
     [[ ${#still[@]} -gt 0 ]] && CYCLE_FAILED=("${still[@]}")
 }
 
-# The router's DNS forwarder dropping a single query is common, self-healing
-# noise — it shows up as a lone dns_router miss that's gone the next cycle and
-# rarely affects real browsing (the system resolver often isn't the gateway).
-# True for a confirmed-failure cycle whose ONLY failing probe is dns_router.
-dns_router_only() {
-    [[ $HAS_DIG -eq 1 && ${#CYCLE_FAILED[@]} -eq 1 && ${CYCLE_FAILED[0]} == dns_router ]]
+# Probes that routinely miss a single cycle without anything actually being
+# down, so a lone miss isn't worth an incident report and a phone alert:
+#   dns_router — the router's DNS forwarder dropping one query is common,
+#     self-healing noise, and rarely affects real browsing (the system resolver
+#     often isn't the gateway).
+#   https_aws  — s3.us-east-1 periodically answers fine but slowly, straddling
+#     CURL_TIMEOUT. Observed 2026-08-03: a 2.3s DNS lookup in one sample and a
+#     4.2s TLS handshake in another, while www.google.com stayed at 0.05s on the
+#     same link in the same moment. That's latency at the destination, not loss.
+# A genuine failure persists into the next cycle; a blip is gone by then.
+DEBOUNCE_PROBES=(dns_router https_aws)
+
+# True for a confirmed-failure cycle whose ONLY failing probe is debounceable.
+single_flaky_probe() {
+    [[ ${#CYCLE_FAILED[@]} -eq 1 ]] || return 1
+    local p
+    for p in "${DEBOUNCE_PROBES[@]}"; do
+        [[ ${CYCLE_FAILED[0]} == "$p" ]] && return 0
+    done
+    return 1
 }
 
 cycle_matrix_line() {
@@ -335,8 +351,11 @@ vpn_indicators() {
     ip -br link show 2>/dev/null \
         | awk '$1 ~ /^(tun|tap|wg|ppp|utun)[0-9]*/ {print "tunnel interface present: " $1}'
     # A resolved link advertising the catch-all (~.) routing domain captures ALL
-    # name resolution for the host
-    have resolvectl && resolvectl domain 2>/dev/null \
+    # name resolution for the host. resolvectl talks to systemd-resolved over
+    # D-Bus and blocks indefinitely when resolved is wedged — which is exactly
+    # the state a VPN teardown leaves it in, i.e. the incident this call is
+    # meant to characterize — so bound it or it stalls the probe loop.
+    have resolvectl && timeout 5 resolvectl domain 2>/dev/null \
         | awk '/~\./ {print "resolver catch-all routing domain: " $0}'
 }
 
@@ -622,7 +641,7 @@ run_daemon() {
         rm -f "$SERVICE_STATUS_FILE"
     fi
     report_startup_gap
-    local clean_streak=0 heartbeat=0 dns_router_pending=0 cycle_i=0
+    local clean_streak=0 heartbeat=0 debounce_pending=0 cycle_i=0
     while true; do
         SERVICE_DUE=0
         (( ${#SERVICE_NAMES[@]} )) && (( cycle_i % SERVICE_EVERY == 0 )) && SERVICE_DUE=1
@@ -646,20 +665,20 @@ run_daemon() {
         if [[ -z $INCIDENT_FILE ]]; then
             [[ ${#CYCLE_FAILED[@]} -gt 0 ]] && confirm_failures
             if [[ ${#CYCLE_FAILED[@]} -gt 0 ]]; then
-                # Debounce a lone dns_router miss: require it to fail two
-                # consecutive cycles before opening an incident. A genuine
-                # forwarder outage persists; a one-off blip is gone next cycle.
-                if dns_router_only && (( dns_router_pending == 0 )); then
-                    dns_router_pending=1
-                    log "dns_router single miss — debouncing one cycle before opening"
+                # Debounce a lone miss on a known-flaky probe: require it to
+                # fail two consecutive cycles before opening an incident. A
+                # genuine outage persists; a one-off blip is gone next cycle.
+                if single_flaky_probe && (( debounce_pending == 0 )); then
+                    debounce_pending=1
+                    log "${CYCLE_FAILED[0]} single miss — debouncing one cycle before opening"
                 else
-                    dns_router_pending=0
+                    debounce_pending=0
                     incident_open
                     incident_record_cycle
                     clean_streak=0
                 fi
             else
-                dns_router_pending=0
+                debounce_pending=0
                 heartbeat=$((heartbeat + 1))
                 # one log line per ~hour so the journal shows it's alive
                 if (( heartbeat * INTERVAL >= 3600 )); then
