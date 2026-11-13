@@ -27,7 +27,9 @@
 #                       A "statuspage:" prefix queries the statuspage.io v2
 #                       API and maps the provider's indicator: "none" = up,
 #                       "minor"/"maintenance" = degraded, "major"/"critical"
-#                       (or API unreachable) = down. A plain http(s) url is a
+#                       (or API unreachable) = down. An unresolved incident
+#                       shows as degraded even when the indicator is "none".
+#                       A plain http(s) url is a
 #                       binary reachability check (up/down only).
 #                       Informational only: shown on the web dashboard, never
 #                       opens incidents, never alerts — answers "is it me or
@@ -174,13 +176,20 @@ parse_service_probes
 
 # Prints the observed level on stdout: up | degraded | down.
 probe_service() {
-    local url=${SERVICE_URL[$1]} ind
+    local url=${SERVICE_URL[$1]} body ind
     if [[ ${SERVICE_KIND[$1]} == statuspage ]]; then
-        # No jq in the minimal image — whitespace-tolerant grep handles both
-        # compact and pretty-printed statuspage JSON.
-        ind=$(curl -s --max-time "$CURL_TIMEOUT" "$url/api/v2/status.json" \
-            | grep -Eo '"indicator"[[:space:]]*:[[:space:]]*"[a-z]+"' | head -n1)
+        # summary.json, not status.json: it also lists unresolved incidents.
+        # Providers often drop the indicator to "none" while an incident is
+        # still open (e.g. "monitoring"), so an open incident counts as at
+        # least degraded. No jq in the minimal image — strip whitespace so
+        # one grep handles compact and pretty-printed JSON.
+        body=$(curl -s --max-time "$CURL_TIMEOUT" "$url/api/v2/summary.json" \
+            | tr -d '[:space:]')
+        ind=$(grep -Eo '"indicator":"[a-z]+"' <<<"$body" | head -n1)
         ind=${ind%\"}; ind=${ind##*\"}
+        if [[ $ind == none && $body == *'"incidents":[{'* ]]; then
+            ind=minor
+        fi
         case $ind in
             none)              echo up ;;
             minor|maintenance) echo degraded ;;
@@ -301,8 +310,13 @@ confirm_failures() {
 #     CURL_TIMEOUT. Observed 2026-08-03: a 2.3s DNS lookup in one sample and a
 #     4.2s TLS handshake in another, while www.google.com stayed at 0.05s on the
 #     same link in the same moment. That's latency at the destination, not loss.
+#   wan_ping_cf, wan_ping_gg, dns_public — each sends exactly one packet, so
+#     low upstream loss trips them on its own. Observed 2026-09-24: 5–12% loss
+#     inside the ISP's transit opened ~30 one-cycle incidents in an evening
+#     while every TCP/HTTPS probe stayed green. A real WAN drop fails several
+#     probes at once, so it never looks like a lone miss.
 # A genuine failure persists into the next cycle; a blip is gone by then.
-DEBOUNCE_PROBES=(dns_router https_aws)
+DEBOUNCE_PROBES=(dns_router https_aws wan_ping_cf wan_ping_gg dns_public)
 
 # True for a confirmed-failure cycle whose ONLY failing probe is debounceable.
 single_flaky_probe() {
@@ -378,12 +392,37 @@ snapshot() {
         curl -sS -o /dev/null --max-time 10 -w "$CURL_TIMING_FMT" https://s3.us-east-1.amazonaws.com/
     section "curl verbose google.com (TLS detail)" \
         curl -sv -o /dev/null --max-time 10 https://www.google.com/generate_204
+    # Trace every destination family the probes cover, not just Cloudflare.
+    # In a destination-specific incident the 1.1.1.1 trace is the one path
+    # still working — tracing only it proves nothing. The traces to 8.8.8.8
+    # and s3.us-east-1 are what pin the failure to an upstream hop.
+    local tracer=() target
     if have mtr; then
-        section "mtr to 1.1.1.1" mtr -rwbz -c3 1.1.1.1
+        tracer=(mtr -rwbz -c3)
     elif have traceroute; then
-        section "traceroute to 1.1.1.1" traceroute -n -w2 -q1 1.1.1.1
+        tracer=(traceroute -n -w2 -q1)
     elif have tracepath; then
-        section "tracepath to 1.1.1.1" tracepath -n 1.1.1.1
+        tracer=(tracepath -n)
+    fi
+    if [[ ${#tracer[@]} -gt 0 ]]; then
+        # Run the traces concurrently: incident_close waits on the snapshot
+        # before writing the report, and three serial traces (~25s, dominated
+        # by unresponsive hops timing out) would stall the probe loop that
+        # long after recovery. Output is buffered per target and emitted in a
+        # fixed order so reports stay diffable.
+        local td pids=(); td=$(mktemp -d)
+        for target in 1.1.1.1 8.8.8.8 s3.us-east-1.amazonaws.com; do
+            section "${tracer[0]} to $target" "${tracer[@]}" "$target" \
+                > "$td/$target" 2>&1 &
+            pids+=($!)
+        done
+        # Wait on these PIDs specifically, not a bare `wait`: --once calls
+        # snapshot in the main shell, which may own other background jobs.
+        wait "${pids[@]}"
+        for target in 1.1.1.1 8.8.8.8 s3.us-east-1.amazonaws.com; do
+            cat "$td/$target"
+        done
+        rm -rf "$td"
     fi
 }
 
@@ -453,16 +492,39 @@ verdict() {
             echo "mtr to 1.1.1.1 in the snapshot) — NOT your router or a TCP/conntrack"
             echo "problem. If 1.1.1.1 is your primary resolver, put a non-Cloudflare"
             echo "server first so a Cloudflare flap doesn't take your DNS with it."
+        elif [[ $(fc https_cloudflare) -eq 0 && $(fc wan_ping_cf) -eq 0 \
+                && $(fc tcp_443) -eq 0 && $(fc https_ip) -eq 0 \
+                && $(fc dns_public) -eq 0 ]]; then
+            # Mirror image of the Cloudflare-only branch above. Every probe
+            # that stayed green targets 1.1.1.1; the ones that failed target
+            # Google or AWS. A local fault (router, NAT, MTU, resolver) cannot
+            # spare one destination and break another, so the fault is upstream.
+            echo "VERDICT: destination-specific — the paths to Google and/or AWS"
+            echo "failed while every Cloudflare-path probe (ping 1.1.1.1, raw TCP"
+            echo "443, TLS to 1.1.1.1, cp.cloudflare.com, @1.1.1.1 DNS) stayed green"
+            echo "throughout. Your LAN, router and ISP first hops were therefore"
+            echo "fine — a local fault could not spare one destination and break"
+            echo "another. This is a routing/peering failure upstream of you."
+            echo "Compare the traces to 8.8.8.8 and s3.us-east-1 against the one to"
+            echo "1.1.1.1 in the snapshot to see which hop the working and broken"
+            echo "paths diverge at."
+            if [[ $(fc wan_ping_gg) -gt 0 ]]; then
+                echo "ICMP to 8.8.8.8 failed too, so this is packets not reaching the"
+                echo "destination — not a TLS, MTU or middlebox problem."
+            fi
         elif [[ $(fc tcp_443) -gt 0 ]]; then
             echo "VERDICT: TCP broken while ICMP and DNS worked — raw TCP connects to"
             echo "port 443 failed. This matches your earlier outage (ping + dig OK, no"
             echo "websites). Suspect: router NAT/conntrack table exhaustion or ISP"
             echo "dropping TCP. Check the router's connection-table stats / uptime."
         else
-            echo "VERDICT: TLS/HTTP layer broken — TCP connects succeeded but HTTPS"
-            echo "requests failed. Suspect: MTU/fragmentation (TLS handshakes use big"
-            echo "packets, pings don't) or an intercepting middlebox. See the curl"
-            echo "timing/verbose sections in the snapshot for where it stalled."
+            echo "VERDICT: HTTPS failed on paths whose TCP was never independently"
+            echo "tested — the raw TCP probe only connects to 1.1.1.1, so it passing"
+            echo "does not prove TCP reached the destinations that broke. Read the"
+            echo "connect= field in the curl timing sections: connect=0 means the TCP"
+            echo "handshake itself never completed (routing/filtering upstream), while"
+            echo "a non-zero connect= with an empty tls= means the TLS handshake"
+            echo "stalled — MTU/fragmentation or an intercepting middlebox."
         fi
         if [[ $HAS_V6 -eq 1 && $(fc https_v6) -gt 0 && $(fc https_google) -eq 0 ]]; then
             echo "Note: only IPv6 HTTPS failed — browsers prefer IPv6, so a broken v6"

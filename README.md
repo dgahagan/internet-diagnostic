@@ -185,12 +185,14 @@ NETWATCH_SERVICE_PROBES="claude=statuspage:https://status.claude.com github=stat
 ```
 
 The `statuspage:` prefix queries the provider's own statuspage.io API
-(`/api/v2/status.json`) instead of just fetching the page — a status page's
+(`/api/v2/summary.json`) instead of just fetching the page — a status page's
 CDN stays up during real outages, the indicator doesn't. The indicator maps
 to three states: `none` = **up** (green), `minor`/`maintenance` =
 **degraded** (yellow), `major`/`critical` or API unreachable = **down**
 (red) — so "partial degradation" on the provider's side shows as exactly
-that, not as a false "down". A plain http(s) URL is a binary reachability
+that, not as a false "down". Providers often reset the indicator to `none`
+while an incident is still open (e.g. "monitoring"), so any unresolved
+incident also shows as **degraded**. A plain http(s) URL is a binary reachability
 check. Probes run ~every 30 s to be polite.
 
 Service probes are **informational by design**: they render as a

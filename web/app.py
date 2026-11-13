@@ -536,11 +536,12 @@ def render_probes():
     if status["services"]:
         for s in status["services"]:
             if s["kind"] == "statuspage":
-                check = (f'GET {s["url"]}/api/v2/status.json each service '
+                check = (f'GET {s["url"]}/api/v2/summary.json each service '
                          'cycle (~30s); maps the provider\'s own indicator: '
                          '"none" = up, "minor"/"maintenance" = degraded '
                          '(yellow), "major"/"critical" or API unreachable '
-                         '= down.')
+                         '= down. Any unresolved incident shows as at least '
+                         'degraded, even when the indicator reads "none".')
             else:
                 check = (f'HTTPS reachability check of {s["url"]} (~30s). '
                          'Binary up/down — no degraded signal to read.')

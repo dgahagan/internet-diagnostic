@@ -27,6 +27,9 @@ PLAYBOOKS_DIR = os.environ.get("NETWATCH_PLAYBOOKS_DIR", "/playbooks.d")
 
 # Probes that all target Cloudflare/1.1.1.1 — used to spot a provider-only loss.
 CF_SET = {"wan_ping_cf", "tcp_443", "https_ip", "https_cloudflare", "dns_public"}
+# Probes that target Google or AWS — the complement used to spot the reverse
+# case, where everything except Cloudflare goes unreachable.
+UPSTREAM_SET = {"wan_ping_gg", "https_google", "https_aws", "https_v6"}
 
 BASE_PLAYBOOKS = [
     {
@@ -160,6 +163,30 @@ BASE_PLAYBOOKS = [
         ],
     },
     {
+        "id": "upstream_path",
+        "title": "Google/AWS unreachable (peering flap)",
+        "severity": "wait",
+        "signature": "Probes targeting Google and/or AWS fail (wan_ping_gg, "
+                     "https_google, https_aws) while every Cloudflare-path "
+                     "probe stays green.",
+        "cause": "Routing/peering failure upstream of you on the paths to "
+                 "Google/AWS. A local fault could not spare one destination "
+                 "and break another, so your LAN, router and ISP first hops "
+                 "are fine. The mirror image of the Cloudflare-path flap.",
+        "just_me": "Anyone routed through the same upstream is affected; "
+                   "Cloudflare-fronted sites keep working, which is what "
+                   "makes it look like a partial outage.",
+        "fixes": [
+            {"desc": "Nothing to fix locally; it clears when the route heals."},
+            {"desc": "Confirm where the paths diverge — compare the traces to "
+                     "8.8.8.8 and s3.us-east-1 against the one to 1.1.1.1 in "
+                     "the incident snapshot."},
+            {"desc": "If it keeps recurring, this is worth an ISP ticket with "
+                     "the incident reports attached — they show the ISP's own "
+                     "hops clean and the failure past them."},
+        ],
+    },
+    {
         "id": "tcp_broken",
         "title": "TCP broken, ICMP/DNS fine",
         "severity": "local",
@@ -179,13 +206,17 @@ BASE_PLAYBOOKS = [
         "id": "tls_mtu",
         "title": "TLS/HTTP broken, TCP fine",
         "severity": "local",
-        "signature": "HTTPS probes failing while raw TCP connects succeed.",
+        "signature": "HTTPS probes failing while raw TCP to 1.1.1.1 succeeds.",
         "cause": "MTU/fragmentation trouble (TLS handshakes use big packets, "
-                 "pings don't) or an intercepting middlebox.",
+                 "pings don't) or an intercepting middlebox. Confirm before "
+                 "acting: tcp_443 only tests 1.1.1.1, so it passing does not "
+                 "prove TCP reached the destinations that failed.",
         "just_me": "Usually affects the whole LAN.",
         "fixes": [
-            {"desc": "Check the curl timing/verbose sections in the snapshot "
-                     "for where the handshake stalls."},
+            {"desc": "Check connect= in the snapshot's curl timing sections "
+                     "first: connect=0 means TCP never completed (a routing "
+                     "problem, not MTU); a non-zero connect= with an empty "
+                     "tls= is a genuine handshake stall."},
             {"desc": "Test a lower MTU:",
              "cmd": f"sudo ip link set {IFACE} mtu 1400  # revert with mtu 1500"},
         ],
@@ -364,6 +395,11 @@ def classify(failing):
         return _get("router_dns")
     if len(f) >= 2 and f <= CF_SET:
         return _get("cloudflare_path")
+    # Mirror of the CF_SET rule above: nothing on the Cloudflare path failed,
+    # but Google/AWS-targeted probes did. Must precede the tls_mtu rule, which
+    # would otherwise claim TCP was fine — tcp_443 only ever tests 1.1.1.1.
+    if len(f) >= 2 and not f & CF_SET and f <= UPSTREAM_SET:
+        return _get("upstream_path")
     if "tcp_443" in f and "dns_system" not in f:
         return _get("tcp_broken")
     if f & {"https_google", "https_cloudflare", "https_aws", "https_ip"} \
