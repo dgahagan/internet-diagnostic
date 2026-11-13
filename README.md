@@ -192,8 +192,17 @@ to three states: `none` = **up** (green), `minor`/`maintenance` =
 (red) — so "partial degradation" on the provider's side shows as exactly
 that, not as a false "down". Providers often reset the indicator to `none`
 while an incident is still open (e.g. "monitoring"), so any unresolved
-incident also shows as **degraded**. A plain http(s) URL is a binary reachability
-check. Probes run ~every 30 s to be polite.
+incident also shows as **degraded**.
+
+Large infrastructure providers (Cloudflare, Akamai, …) almost always report
+`minor` for some narrow product or regional issue, so `statuspage:` would show
+them as permanently degraded. Use the `statuspage-major:` prefix for those: it
+reads the same API but only `major` (= **degraded**) and `critical` or an
+unreachable API (= **down**) count.
+
+A plain http(s) URL is a binary reachability check. Any HTTP status below 500
+is **up** — redirects and 4xx prove the service answered — while 5xx, timeouts
+and connect failures are **down**. Probes run ~every 30 s to be polite.
 
 Service probes are **informational by design**: they render as a
 "Services" row in the dashboard grid and a "not your network" notice when

@@ -542,9 +542,19 @@ def render_probes():
                          '(yellow), "major"/"critical" or API unreachable '
                          '= down. Any unresolved incident shows as at least '
                          'degraded, even when the indicator reads "none".')
+            elif s["kind"] == "statuspage-major":
+                check = (f'GET {s["url"]}/api/v2/summary.json each service '
+                         'cycle (~30s); large-provider mode — only the top '
+                         'indicator levels count: "major" = degraded '
+                         '(yellow), "critical" or API unreachable = down. '
+                         '"minor", "maintenance" and open incidents stay '
+                         'green, because big providers always have some '
+                         'narrow product or regional issue open.')
             else:
                 check = (f'HTTPS reachability check of {s["url"]} (~30s). '
-                         'Binary up/down — no degraded signal to read.')
+                         'Binary up/down: any HTTP status below 500 is up '
+                         '(redirects and 4xx prove it answered); 5xx, '
+                         'timeouts and connect failures are down.')
             dot = {"ok": '<span class="dot ok"></span> passing',
                    "warn": '<span class="dot warn"></span> degraded '
                            '(provider-reported)',
@@ -567,7 +577,9 @@ def render_probes():
               '<code>claude=statuspage:https://status.claude.com '
               'github=statuspage:https://www.githubstatus.com</code> — the '
               '<code>statuspage:</code> prefix reads the provider\'s own '
-              'status API; a plain URL is a reachability check.</p>')
+              'status API, <code>statuspage-major:</code> does the same but '
+              'ignores minor issues (for Cloudflare-scale providers); a '
+              'plain URL is a reachability check.</p>')
     return page("netwatch probes", intro + cards)
 
 

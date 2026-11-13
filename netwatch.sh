@@ -29,8 +29,15 @@
 #                       "minor"/"maintenance" = degraded, "major"/"critical"
 #                       (or API unreachable) = down. An unresolved incident
 #                       shows as degraded even when the indicator is "none".
-#                       A plain http(s) url is a
-#                       binary reachability check (up/down only).
+#                       A "statuspage-major:" prefix reads the same API but
+#                       ignores the routine noise of large providers
+#                       (Cloudflare, Akamai sit at "minor" most days):
+#                       "none"/"minor"/"maintenance" and open incidents = up,
+#                       "major" = degraded, "critical" (or unreachable) = down.
+#                       A plain http(s) url is a binary reachability check
+#                       (up/down only): any HTTP status below 500 is up —
+#                       redirects and 4xx prove the service answered — while
+#                       5xx, timeouts and connect failures are down.
 #                       Informational only: shown on the web dashboard, never
 #                       opens incidents, never alerts — answers "is it me or
 #                       them?" when a SaaS you rely on is having a bad day.
@@ -158,7 +165,10 @@ parse_service_probes() {
             continue
         fi
         kind=https
-        [[ $url == statuspage:* ]] && { kind=statuspage; url=${url#statuspage:}; }
+        case $url in
+            statuspage-major:*) kind=statuspage-major; url=${url#statuspage-major:} ;;
+            statuspage:*)       kind=statuspage;       url=${url#statuspage:} ;;
+        esac
         if [[ $url != http://* && $url != https://* ]]; then
             log "service probe skipped — not an http(s) url: $pair"
             continue
@@ -176,17 +186,30 @@ parse_service_probes
 
 # Prints the observed level on stdout: up | degraded | down.
 probe_service() {
-    local url=${SERVICE_URL[$1]} body ind
-    if [[ ${SERVICE_KIND[$1]} == statuspage ]]; then
+    local url=${SERVICE_URL[$1]} kind=${SERVICE_KIND[$1]} body ind code
+    if [[ $kind == statuspage || $kind == statuspage-major ]]; then
         # summary.json, not status.json: it also lists unresolved incidents.
-        # Providers often drop the indicator to "none" while an incident is
-        # still open (e.g. "monitoring"), so an open incident counts as at
-        # least degraded. No jq in the minimal image — strip whitespace so
-        # one grep handles compact and pretty-printed JSON.
+        # No jq in the minimal image — strip whitespace so one grep handles
+        # compact and pretty-printed JSON.
         body=$(curl -s --max-time "$CURL_TIMEOUT" "$url/api/v2/summary.json" \
             | tr -d '[:space:]')
         ind=$(grep -Eo '"indicator":"[a-z]+"' <<<"$body" | head -n1)
         ind=${ind%\"}; ind=${ind##*\"}
+        if [[ $kind == statuspage-major ]]; then
+            # Large providers always have some narrow product or regional
+            # issue open, so "minor" and open incidents say nothing about
+            # whether the internet at large is affected. Only the top two
+            # indicator levels count.
+            case $ind in
+                none|minor|maintenance) echo up ;;
+                major)                  echo degraded ;;
+                *)                      echo down ;;   # critical, unreachable, unparseable
+            esac
+            return
+        fi
+        # Providers often drop the indicator to "none" while an incident is
+        # still open (e.g. "monitoring"), so an open incident counts as at
+        # least degraded.
         if [[ $ind == none && $body == *'"incidents":[{'* ]]; then
             ind=minor
         fi
@@ -197,7 +220,12 @@ probe_service() {
         esac
     else
         # Plain reachability has no degraded signal to read — binary only.
-        if curl -s -o /dev/null --max-time "$CURL_TIMEOUT" "$url"; then
+        # Check the status code, not just curl's exit status: a SaaS outage
+        # usually still answers, with a 5xx from its front door. 3xx/4xx
+        # count as up — login pages redirect, and APIs 401/404 a bare GET.
+        # 000 = no HTTP response at all (DNS, connect, TLS or timeout).
+        code=$(curl -s -o /dev/null --max-time "$CURL_TIMEOUT" -w '%{http_code}' "$url")
+        if [[ $code =~ ^[1-4][0-9][0-9]$ ]]; then
             echo up
         else
             echo down
