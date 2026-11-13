@@ -34,6 +34,10 @@
 #                       (Cloudflare, Akamai sit at "minor" most days):
 #                       "none"/"minor"/"maintenance" and open incidents = up,
 #                       "major" = degraded, "critical" (or unreachable) = down.
+#                       A "slackstatus:" prefix reads Slack's own status API
+#                       (/api/v2.0.0/current): "ok" = up, an active incident
+#                       or notice = degraded, an active outage (or API
+#                       unreachable) = down.
 #                       A plain http(s) url is a binary reachability check
 #                       (up/down only): any HTTP status below 500 is up —
 #                       redirects and 4xx prove the service answered — while
@@ -168,6 +172,7 @@ parse_service_probes() {
         case $url in
             statuspage-major:*) kind=statuspage-major; url=${url#statuspage-major:} ;;
             statuspage:*)       kind=statuspage;       url=${url#statuspage:} ;;
+            slackstatus:*)      kind=slackstatus;      url=${url#slackstatus:} ;;
         esac
         if [[ $url != http://* && $url != https://* ]]; then
             log "service probe skipped — not an http(s) url: $pair"
@@ -218,6 +223,21 @@ probe_service() {
             minor|maintenance) echo degraded ;;
             *)                 echo down ;;   # major/critical, unreachable, unparseable
         esac
+    elif [[ $kind == slackstatus ]]; then
+        # Slack runs its own status API, not statuspage.io. Top-level
+        # "status" is "ok" with nothing open, or "active" with entries in
+        # active_incidents, each typed "outage", "incident" or "notice".
+        body=$(curl -s --max-time "$CURL_TIMEOUT" "$url/api/v2.0.0/current" \
+            | tr -d '[:space:]')
+        if [[ $body == *'"status":"ok"'* && $body == *'"active_incidents":[]'* ]]; then
+            echo up
+        elif [[ $body == *'"active_incidents":['* && $body == *'"type":"outage"'* ]]; then
+            echo down
+        elif [[ $body == *'"active_incidents":[{'* ]]; then
+            echo degraded
+        else
+            echo down   # unreachable or unparseable
+        fi
     else
         # Plain reachability has no degraded signal to read — binary only.
         # Check the status code, not just curl's exit status: a SaaS outage

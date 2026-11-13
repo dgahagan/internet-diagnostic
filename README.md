@@ -200,6 +200,14 @@ them as permanently degraded. Use the `statuspage-major:` prefix for those: it
 reads the same API but only `major` (= **degraded**) and `critical` or an
 unreachable API (= **down**) count.
 
+Slack does not use statuspage.io. The `slackstatus:` prefix reads Slack's own
+API (`/api/v2.0.0/current`): `ok` = **up**, an active incident or notice =
+**degraded**, an active outage or an unreachable API = **down**:
+
+```sh
+slack=slackstatus:https://slack-status.com
+```
+
 A plain http(s) URL is a binary reachability check. Any HTTP status below 500
 is **up** — redirects and 4xx prove the service answered — while 5xx, timeouts
 and connect failures are **down**. Probes run ~every 30 s to be polite.

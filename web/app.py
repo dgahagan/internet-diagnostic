@@ -550,6 +550,12 @@ def render_probes():
                          '"minor", "maintenance" and open incidents stay '
                          'green, because big providers always have some '
                          'narrow product or regional issue open.')
+            elif s["kind"] == "slackstatus":
+                check = (f'GET {s["url"]}/api/v2.0.0/current each service '
+                         'cycle (~30s); reads Slack\'s own status API: "ok" '
+                         '= up, an active incident or notice = degraded '
+                         '(yellow), an active outage or API unreachable = '
+                         'down.')
             else:
                 check = (f'HTTPS reachability check of {s["url"]} (~30s). '
                          'Binary up/down: any HTTP status below 500 is up '
@@ -578,7 +584,8 @@ def render_probes():
               'github=statuspage:https://www.githubstatus.com</code> — the '
               '<code>statuspage:</code> prefix reads the provider\'s own '
               'status API, <code>statuspage-major:</code> does the same but '
-              'ignores minor issues (for Cloudflare-scale providers); a '
+              'ignores minor issues (for Cloudflare-scale providers), '
+              '<code>slackstatus:</code> reads Slack\'s status API; a '
               'plain URL is a reachability check.</p>')
     return page("netwatch probes", intro + cards)
 
