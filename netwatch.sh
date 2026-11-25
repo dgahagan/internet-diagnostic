@@ -196,7 +196,7 @@ probe_service() {
         # summary.json, not status.json: it also lists unresolved incidents.
         # No jq in the minimal image — strip whitespace so one grep handles
         # compact and pretty-printed JSON.
-        body=$(curl -s --max-time "$CURL_TIMEOUT" "$url/api/v2/summary.json" \
+        body=$(curl -s -L --max-redirs 3 --max-time "$CURL_TIMEOUT" "$url/api/v2/summary.json" \
             | tr -d '[:space:]')
         ind=$(grep -Eo '"indicator":"[a-z]+"' <<<"$body" | head -n1)
         ind=${ind%\"}; ind=${ind##*\"}
@@ -227,7 +227,7 @@ probe_service() {
         # Slack runs its own status API, not statuspage.io. Top-level
         # "status" is "ok" with nothing open, or "active" with entries in
         # active_incidents, each typed "outage", "incident" or "notice".
-        body=$(curl -s --max-time "$CURL_TIMEOUT" "$url/api/v2.0.0/current" \
+        body=$(curl -s -L --max-redirs 3 --max-time "$CURL_TIMEOUT" "$url/api/v2.0.0/current" \
             | tr -d '[:space:]')
         if [[ $body == *'"status":"ok"'* && $body == *'"active_incidents":[]'* ]]; then
             echo up
